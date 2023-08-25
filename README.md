@@ -92,7 +92,8 @@ Copying is necessary as Agda does not support having `.lagda.tex`- and
 allows the `.agda`-files, which should be converted to LaTeX, to
 dependent on the rest of the project.
 
-For smaller projects, you might want to explicitly specify the root directory via the `--root` flag.
+For smaller projects without a `.agda-lib`-file, you might want to
+explicitly specify the root directory via the `--root` flag.
 
 ## Complete Example
 
