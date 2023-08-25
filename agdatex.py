@@ -62,6 +62,7 @@ else:
 
 root = root.absolute()
 
+
 # Check if sources are relative to project root
 
 src_paths = []
