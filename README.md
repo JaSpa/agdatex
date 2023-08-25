@@ -1,6 +1,6 @@
 # agdatex
 
-`agdatex` allows to extract reusable LaTeX-Macros from `.agda`-files with special annotation-comments.
+`agdatex` allows to extract reusable LaTeX-Macros from `.agda`-files annotated via comments.
 
 ## Annotations
 
