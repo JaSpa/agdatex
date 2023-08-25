@@ -1,0 +1,8 @@
+*.agdai
+
+*.pdf
+
+*.swp
+*.swo
+.#*
+*.log
