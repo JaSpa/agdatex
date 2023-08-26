@@ -100,7 +100,7 @@ has the following effect:
 -   the temp directory is removed again.
 
 The `main.tex`-file can then import all generated macros via
-`\usepackage{latex/agda-generated}`.
+`\usepackage{agda-generated}`.
 
 Copying is necessary as Agda does not support having `.lagda.tex`- and
 `.agda`-files with the same name. Copying the entire project root
