@@ -122,12 +122,14 @@ for src_path, tgt_path in zip(src_paths, tgt_paths):
         mode = "command"
         opt = "[inline]" if is_inline else ""
         tgt += "\\newcommand*\\" + name + "{"
+        tgt += "\\begin{AgdaAlign}"
         tgt += "\\begin{AgdaSuppressSpace}"
         tgt += "\\begin{code}" + opt + "\n"
     def stop_command():
         global mode, tgt, prefixes
         tgt += "\\end{code}"
         tgt += "\\end{AgdaSuppressSpace}"
+        tgt += "\\end{AgdaAlign}"
         tgt += "}\n"
         mode = "none"
     for line_num, line in enumerate(src.splitlines()):
