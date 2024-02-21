@@ -127,7 +127,7 @@ for src_path, tgt_path in zip(src_paths, tgt_paths):
     opt = ""
     def start_command(name, is_inline):
         global mode, tgt, prefixes, opt
-        for p in prefixes:
+        for p in reversed(prefixes):
             name = p + name
         commands.append(name)
         if mode == "hide":
