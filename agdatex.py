@@ -34,6 +34,12 @@ ap.add_argument("-r", "--root", metavar="PATH",
 ap.add_argument("-i", "--index", metavar="PATH",
                 help="Write the list of generated macros to this file.")
 
+ap.add_argument("-v", "--verbose", action='store_true',
+                     help="Turn on verbosity")
+
+ap.add_argument("-n", "--noop", action='store_true',
+                    help="No action: dry run")
+
 ap.add_argument("sources", metavar="SRC_PATH", nargs="+",
                 help="Path to an annotated .agda-file.")
 
@@ -62,6 +68,8 @@ else:
 
 root = root.absolute()
 
+if args.verbose:
+    print (f"VERBOSE: root = {root}")
 
 # Check if sources are relative to project root
 
@@ -73,6 +81,8 @@ for p in args.sources:
         print(f"ERROR: Source path '{p}' is not relative to root '{root}'.")
         sys.exit(1)
 
+if args.verbose:
+    print (f"VERBOSE: src_paths = {src_paths}")
 
 # Create temporary directory
 
@@ -83,6 +93,11 @@ else:
     tmp_root_obj = tempfile.TemporaryDirectory(prefix="agdatex")
     tmp_root = Path(tmp_root_obj.name)
 
+if args.verbose:
+    print (f"VERBOSE: tmp_root = {tmp_root}")
+
+if args.noop:
+    sys.exit("[no harm done]")
 
 # Copy project root to temporary directory
 
