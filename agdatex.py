@@ -140,6 +140,15 @@ for src_path, tgt_path in zip(src_paths, tgt_paths):
         global mode, tgt, prefixes
         tgt += "\\end{code}}\n"
         mode = "none"
+    def latexname(name: str) -> bool:
+        return name.isascii() and name.isalpha()
+    def asciify(name: str) -> str:
+        return ''.join( (c if latexname(c) else 'X') for c in name )
+    def checked_latex_ident(name: str, line_num: int) -> str:
+        if not latexname(name):
+            print(f"WARNING: Illegal characters in '{name}' in line {line_num} replaced by X")
+            name = asciify(name)
+        return name
     for line_num, line in enumerate(src.splitlines()):
         l = line.strip()
         if l.startswith("--!") or l.startswith("-- !"):
@@ -152,16 +161,17 @@ for src_path, tgt_path in zip(src_paths, tgt_paths):
             if is_inline:
                 l = l[1:].strip()
             if "{" in l:
-                name = l.split(" ", 1)[0]
+                name = checked_latex_ident(l.split(" ", 1)[0], line_num)
                 start_command(name, is_inline)
             elif "}" in l:
                 stop_command()
             elif ">" in l:
-                prefixes.append(l.split(" ", 1)[0])
+                pref = checked_latex_ident(l.split(" ", 1)[0], line_num)
+                prefixes.append(pref)
             elif "<" in l:
                 prefixes.pop()
             else:
-                name = l.split(" ", 1)[0]
+                name = checked_latex_ident(l.split(" ", 1)[0], line_num)
                 start_command(name, is_inline)
                 stop_command_on_empty_line = True
                 # print(f"ERROR: Line {line_num} contains invalid agdatex command:\n  {line}")
