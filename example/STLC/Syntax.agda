@@ -22,3 +22,12 @@ inline-example : Expr → Expr
 inline-example =
   --!! EAbs
   λx_
+
+--! HideExample {
+missing : Expr
+missing =
+--! [
+  (` 0)
+--! ]
+  · (` 1)
+--! }

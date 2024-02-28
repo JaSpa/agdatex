@@ -56,6 +56,10 @@ The following comment annotations are supported:
 -   `--!! NAME` behaves like `--!` but the resulting macro typesets
     the code inline and not as a block.
 
+-   `--! [` hides code inside of a command.
+
+-   `--! ]` stops hiding code inside of a command.
+
 ## Usage
 
 Let's say you have a project structure like
