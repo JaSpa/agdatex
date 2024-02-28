@@ -7,7 +7,8 @@ from argparse import ArgumentParser
 import tempfile
 import subprocess
 import shutil
-
+import json
+import hashlib
 
 # Parse Arguments
 
@@ -95,6 +96,25 @@ else:
 
 if args.verbose:
     print (f"VERBOSE: tmp_root = {tmp_root}")
+
+old_hashes = dict()
+try:
+    with open(".agdatex-hashes.json") as digest:
+        old_hashes = json.load(digest)
+except (OSError, json.decoder.JSONDecodeError):
+    if args.verbose:
+        print (f"VERBOSE: cannot read hashes")
+
+if args.verbose:
+    print(f"VERBOSE: {old_hashes=}")
+
+current_hashes = dict()
+for src_path in src_paths:
+    with open (root / src_path, "rb") as fp:
+        current_hashes[str(src_path)] = hashlib.file_digest(fp, "sha256").hexdigest()
+
+if args.verbose:
+    print(f"VERBOSE: {current_hashes=}")
 
 if args.noop:
     sys.exit("[no harm done]")
@@ -221,13 +241,24 @@ output_dir = Path(args.outputdir)
 output_dir.mkdir(exist_ok=True)
 
 print("Running agda with latex backend...")
-for tgt_path in tgt_paths:
+for src_path, tgt_path in zip(src_paths, tgt_paths):
+    if current_hashes[str(src_path)] == old_hashes.get(str(src_path), ''):
+        print(f"  Skipping {tgt_path} (no change)...")
+        continue
     print(f"  Processing {tgt_path}...")
     subprocess.run(
         ["agda", "--latex", "--only-scope-checking", "--latex-dir=" + str(output_dir.absolute()), str(tgt_path)],
         cwd=tmp_root,
     )
 
+# save current file hashes
+
+try:
+    with open(".agdatex-hashes.json", "w") as digest:
+        json.dump(current_hashes, digest)
+except OSError:
+    if args.verbose:
+        print (f"VERBOSE: cannot write hashes")
 
 # Create an export .tex-file which imports all generated .tex-files.
 
