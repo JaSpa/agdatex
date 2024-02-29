@@ -101,7 +101,7 @@ if args.verbose:
     print (f"VERBOSE: tmp_root = {tmp_root}")
 
 old_hashes = dict()
-if arg.clear:
+if args.clear:
     printf (f"VERBOSE: ignoring cached hashes")
 else:
     try:
