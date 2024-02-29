@@ -41,6 +41,9 @@ ap.add_argument("-v", "--verbose", action='store_true',
 ap.add_argument("-n", "--noop", action='store_true',
                     help="No action: dry run")
 
+ap.add_argument ("-c", "--clear", action='store_true',
+                     help="Clear cashes to force rebuild all")
+
 ap.add_argument("sources", metavar="SRC_PATH", nargs="+",
                 help="Path to an annotated .agda-file.")
 
@@ -98,12 +101,15 @@ if args.verbose:
     print (f"VERBOSE: tmp_root = {tmp_root}")
 
 old_hashes = dict()
-try:
-    with open(".agdatex-hashes.json") as digest:
-        old_hashes = json.load(digest)
-except (OSError, json.decoder.JSONDecodeError):
-    if args.verbose:
-        print (f"VERBOSE: cannot read hashes")
+if arg.clear:
+    printf (f"VERBOSE: ignoring cached hashes")
+else:
+    try:
+        with open(".agdatex-hashes.json") as digest:
+            old_hashes = json.load(digest)
+    except (OSError, json.decoder.JSONDecodeError) as e:
+        if args.verbose:
+            print (f"VERBOSE: cannot read hashes ({e})")
 
 if args.verbose:
     print(f"VERBOSE: {old_hashes=}")
