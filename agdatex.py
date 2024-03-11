@@ -102,7 +102,8 @@ if args.verbose:
 
 old_hashes = dict()
 if args.clear:
-    printf (f"VERBOSE: ignoring cached hashes")
+    if args.verbose:
+        print(f"VERBOSE: ignoring cached hashes")
 else:
     try:
         with open(".agdatex-hashes.json") as digest:
