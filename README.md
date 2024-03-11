@@ -3,6 +3,10 @@
 `agdatex` allows to extract reusable LaTeX-Macros from `.agda`-files
 annotated via comments.
 
+## Dependencies
+
+- Python >= 3.11
+
 ## Annotations
 
 The following comment annotations are supported:
