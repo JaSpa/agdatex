@@ -298,7 +298,7 @@ else:
 src_names = [ p.stem for p in src_paths ]
 s = ""
 if export_file.suffix == ".sty":
-    s += "\ProvidesPackage{" + export_file.stem + "}\n"
+    s += "\\ProvidesPackage{" + export_file.stem + "}\n"
 for p in output_dir.glob("**/*.tex"):
     if p.stem in src_names:
         s += "\\input{" + str(p.relative_to(output_dir)) + "}\n"
