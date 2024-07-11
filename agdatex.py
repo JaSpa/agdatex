@@ -23,6 +23,9 @@ ap.add_argument("-o", "--outputdir", metavar="PATH", default="latex",
 ap.add_argument("-e", "--exportfile", metavar="PATH",
                 help="This file will \\input all generated .tex files. Both .tex and .sty are supported. Default: 'OUTPUTDIR/agda-generated.sty'.")
 
+ap.add_argument("-f", "--fullpath", action='store_true',
+                    help="Write full path to the generated .tex files into the exportfile.")
+
 ap.add_argument("-t", "--tempdir", metavar="PATH",
                 help="Temporary directory to copy the project root to. Default: fresh system-dependent temporary dir.")
 
@@ -301,7 +304,10 @@ if export_file.suffix == ".sty":
     s += "\\ProvidesPackage{" + export_file.stem + "}\n"
 for p in output_dir.glob("**/*.tex"):
     if p.stem in src_names:
-        s += "\\input{" + str(p.relative_to(output_dir)) + "}\n"
+        if args.fullpath:
+            s += "\\input{" + str(p) + "}\n"
+        else:
+            s += "\\input{" + str(p.relative_to(output_dir)) + "}\n"
 with open(export_file, 'w') as f:
     f.write(s)
 
