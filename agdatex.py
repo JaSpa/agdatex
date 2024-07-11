@@ -36,13 +36,13 @@ ap.add_argument("-i", "--index", metavar="PATH",
                 help="Write the list of generated macros to this file.")
 
 ap.add_argument("-v", "--verbose", action='store_true',
-                     help="Turn on verbosity")
+                    help="Turn on verbosity")
 
 ap.add_argument("-n", "--noop", action='store_true',
                     help="No action: dry run")
 
-ap.add_argument ("-c", "--clear", action='store_true',
-                     help="Clear cashes to force rebuild all")
+ap.add_argument("-c", "--clear", action='store_true',
+                    help="Clear cashes to force rebuild all")
 
 ap.add_argument("sources", metavar="SRC_PATH", nargs="+",
                 help="Path to an annotated .agda-file.")
