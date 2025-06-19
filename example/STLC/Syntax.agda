@@ -31,3 +31,14 @@ missing =
 --! ]
   · (` 1)
 --! }
+
+--! SizeI {
+size : ℕ
+size (` x)   = 1
+--! }
+--! SizeII {
+size (λx M)  = 1 + size M
+--! }
+--! SizeIII {
+size (M · N) = 1 + size M + size N
+--! }
