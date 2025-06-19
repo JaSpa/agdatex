@@ -150,7 +150,7 @@ for src_path, tgt_path in zip(src_paths, tgt_paths):
     with open(tmp_root / src_path, 'r') as f:
         src = f.read();
 
-    tgt = ""
+    tgt = "\\usepackage{xparse}\n\n"
     prefixes = []
     mode = "none"
     stop_command_on_empty_line = False
@@ -166,15 +166,13 @@ for src_path, tgt_path in zip(src_paths, tgt_paths):
             print(f"ERROR: Line {line_num+1} starts a nested command:\n  {line}")
         mode = "command"
         opt = "[inline]" if is_inline else ""
-        tgt += "\\newcommand*\\" + name + "{"
-        tgt += "\\begin{AgdaAlign}"
-        tgt += "\\begin{AgdaSuppressSpace}"
+        tgt += "\\NewDocumentCommand\\" + name + "{s}{"
+        tgt += "\\IfBooleanF{#1}{\\begin{AgdaAlign}\\begin{AgdaSuppressSpace}}\n"
         tgt += "\\begin{code}" + opt + "\n"
     def stop_command():
         global mode, tgt, prefixes
-        tgt += "\\end{code}"
-        tgt += "\\end{AgdaSuppressSpace}"
-        tgt += "\\end{AgdaAlign}"
+        tgt += "\\end{code}\n"
+        tgt += "\\IfBooleanF{#1}{\\end{AgdaSuppressSpace}\\end{AgdaAlign}}"
         tgt += "}\n"
         mode = "none"
     def latexname(name: str) -> bool:

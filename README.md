@@ -64,6 +64,38 @@ The following comment annotations are supported:
 
 -   `--! ]` stops hiding code inside of a command.
 
+## Alignment between multiple code blocks
+
+The code typeset by a single extracted macro is wrapped in an `AgdaAlign`
+environment. This is necessary to ensure proper alignment if segments inside a
+single macro are hidden using `--! [` and `--! ]`.
+
+But to align code from multiple macros a surrounding `AgdaAlign` environment is
+required. `AgdaAlign` environments, however, (or similar environments, such as
+`AgdaMultiCode`) may not be nested. Instead, use the starred version of the
+extracted macro `\Foo*` which _does not_ wrap the code in
+`AgdaAlign`/`AgdaSuppressSpace` but makes this your reponsibility.
+
+```latex
+\begin{AgdaAlign}
+\FunctionPartI*
+... explanation/intermediate prose ...
+\FunctionPartII*
+\end{AgdaAlign}
+```
+
+In some cases the starred version may also provide a workaround for [`! Package
+array Error: Empty preamble: 'l' used.`][issue 7290]. If LaTeX emits this error
+for a macro which does not require an explicit `AgdaAlign` environment (ie. no
+`--! [` and `--! ]`) you can try using the starred version of the macro.
+
+For further information regarding [alignment][] and [multiple code blocks][]
+please refer to the Agda documentation.
+
+[alignment]: https://agda.readthedocs.io/en/stable/tools/generating-latex.html#alignment
+[multiple code blocks]: https://agda.readthedocs.io/en/stable/tools/generating-latex.html#breaking-up-code-blocks
+[issue 7290]: https://github.com/agda/agda/issues/7290
+
 ## Usage
 
 Let's say you have a project structure like
