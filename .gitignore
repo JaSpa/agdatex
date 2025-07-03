@@ -8,3 +8,8 @@ _cache/
 *.swo
 .#*
 *.log
+
+
+# Added by cargo
+
+/target
