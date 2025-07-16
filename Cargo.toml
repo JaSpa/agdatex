@@ -4,3 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+base64 = "0.22.1"
+clap = { version = "4.5.40", features = ["derive", "cargo"] }
+color-eyre = { version = "0.6.5", default-features = false }
+fs_at = "0.2.1"
+libc = "0.2.174"
+merde = { version = "10.0.7", features = ["deserialize", "json", "serialize"] }
+merde_json = "10.0.6"
+sha2 = "0.10.9"
+tempdir = "0.3.7"
