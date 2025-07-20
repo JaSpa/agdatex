@@ -19,6 +19,10 @@ impl StringStack {
         self.lens.is_empty()
     }
 
+    pub fn as_str(&self) -> &str {
+        &self.data
+    }
+
     pub fn clear(&mut self) {
         self.data.clear();
         self.lens.clear();

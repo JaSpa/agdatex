@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    cell::LazyCell,
     collections::HashMap,
     ffi::{OsStr, OsString},
     fs::{File, OpenOptions},
@@ -15,15 +16,19 @@ use color_eyre::{
     Result, Section, SectionExt,
     eyre::{Context, eyre},
 };
+use fs_at::OpenOptions as OpenOptionsAt;
 use merde::MerdeError;
 use sha2::{
     Sha256,
     digest::{OutputSizeUser, generic_array::GenericArray},
 };
 use tempdir::TempDir;
+use translation::Translator;
 
-//mod contiguous_stack;
-//use contiguous_stack::PathStack;
+mod ltx_write;
+mod span_str;
+mod string_stack;
+mod translation;
 
 #[derive(Clone, Copy)]
 struct VerbOutput {
@@ -37,10 +42,6 @@ impl VerbOutput {
         }
     }
 
-    fn writeln<Msg: std::fmt::Display>(self, msg: impl FnOnce() -> Msg) {
-        self.if_enabled(|| eprintln!("{}", msg()));
-    }
-
     fn write_err(self, error: color_eyre::Report) {
         if self.enabled {
             eprintln!("{error:?}")
@@ -50,60 +51,42 @@ impl VerbOutput {
     }
 }
 
+macro_rules! verb {
+    ($v:expr, $($arg:tt)*) => {
+        VerbOutput::if_enabled($v, || eprintln!($($arg)*))
+    };
+}
+
 #[derive(Debug, Parser)]
 struct Args {
     /// Output directory for Agda's LaTeX backend; forwarded as `--latex-dir`.
-    #[clap(short, long = "outputdir", default_value = "latex")]
+    #[arg(short, long = "outputdir", default_value = "latex")]
     output_dir: PathBuf,
 
     /// This file will `\input` all generated .tex files. Both .tex and .sty are supported.
     /// [default: `<OUTPUTDIR>/agda-generated.sty`]
-    #[clap(short, long = "exportfile")]
+    #[arg(short, long = "exportfile")]
     export_file: Option<PathBuf>,
-
-    /// Write full path to the generated .tex files into <EXPORTFILE>.
-    #[clap(short, long = "fullpath")]
-    full_path: bool,
 
     /// Temporary directory to copy the project root to. (default: fresh system-dependent temporary
     /// directory.
-    #[clap(short, long = "tempdir")]
+    #[arg(short, long = "tempdir")]
     temp_dir: Option<PathBuf>,
 
-    /// Project root. [default: `git rev-parse --show-toplevel`]
-    #[clap(short, long)]
-    root: Option<PathBuf>,
-
     /// Write the list of generated macros to this file.
-    #[clap(short, long)]
+    #[arg(short, long)]
     index: Option<PathBuf>,
 
     /// Enable verbose output.
-    #[clap(short, long)]
+    #[arg(short, long)]
     verbose: bool,
 
     /// Clear caches to force a rebuild of all modules.
-    #[clap(short, long)]
+    #[arg(short, long)]
     clear: bool,
 
     /// Paths to annotated .agda files.
     sources: Vec<PathBuf>,
-}
-
-fn discover_root() -> Result<PathBuf> {
-    let mut output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .success_output()?;
-
-    // Trim a trailing newline from the output.
-    if output.stdout.last() == Some(&b'\n') {
-        _ = output.stdout.pop();
-    }
-
-    // Turn output into a PathBuf.
-    let output_str = OsString::from_vec(output.stdout);
-    let root_path = PathBuf::from(output_str);
-    Ok(root_path)
 }
 
 fn normalize_source(path: impl AsRef<Path>, root: impl AsRef<Path>) -> Result<PathBuf> {
@@ -184,9 +167,9 @@ fn with_cache<R: 'static>(
     let mut cache = match from_disk {
         FromDisk::CleanCache => {
             if from_disk_flag {
-                verb.writeln(|| format!("cache: {CACHE_PATH} does not exist"));
+                verb!(verb, "cache: {CACHE_PATH} does not exist");
             } else {
-                verb.writeln(|| "cache: ignoring any cached state");
+                verb!(verb, "cache: ignoring any cached state");
             }
             Cache::default()
         }
@@ -228,31 +211,22 @@ fn main() -> Result<()> {
     if args.sources.is_empty() {
         return Err(eyre!("no inputs given"));
     }
+    verb!(verb, "Command line options: {args:#?}");
 
-    verb.writeln(|| format!("Command line options: {args:#?}"));
-
-    let root = if let Some(root) = args.root {
-        root.canonicalize()?
-    } else {
-        discover_root().wrap_err("failed to detect project root; try `--root <ROOT>`")?
-    };
-    verb.writeln(|| format!("Resolved project root: {}", root.display()));
-
+    let root = std::env::current_dir()?.canonicalize()?;
     let sources = args
         .sources
         .into_iter()
         .map(|src| normalize_source(src, &root))
         .collect::<Result<Vec<_>>>()?;
-    verb.writeln(|| format!("Canonicalized sources: {sources:#?}"));
+    verb!(verb, "Canonicalized sources: {sources:#?}");
 
     let mut tmp_dir: Option<TempDir> = None;
     let resolved_args = Agdatex {
         verb,
-        root,
         output_dir: args.output_dir,
         export_file: args.export_file,
         index: args.index,
-        full_path: args.full_path,
         temp_dir: if let Some(tmp) = args.temp_dir {
             tmp
         } else {
@@ -261,11 +235,14 @@ fn main() -> Result<()> {
             tmp_dir = Some(tmp);
             path
         },
-        source_buffer: String::new(),
-        translated_paths: Vec::new(),
+        state: State::default(),
     };
 
-    verb.writeln(|| format!("Temporary directory: {}", resolved_args.temp_dir.display(),));
+    verb!(
+        verb,
+        "Temporary directory: {}",
+        resolved_args.temp_dir.display()
+    );
 
     let result = with_cache(!args.clear, verb, |cache| resolved_args.run(cache, sources));
 
@@ -389,26 +366,20 @@ merde::derive! {
 type Cache<'a> = HashMap<CachePath<Cow<'a, Path>>, CacheEntry>;
 
 struct Agdatex {
-    root: PathBuf,
     output_dir: PathBuf,
     export_file: Option<PathBuf>,
     index: Option<PathBuf>,
-    full_path: bool,
     temp_dir: PathBuf,
     verb: VerbOutput,
-    source_buffer: String,
-    translated_paths: Vec<PathBuf>,
+    state: State,
 }
 
-enum Item<'a, 'b> {
-    UserInput {
-        path: PathBuf,
-    },
-    ChildItem {
-        parent_fd: &'a File,
-        parent_path: &'a mut ChildPathBuf<'b>,
-        name: &'a OsStr,
-    },
+#[derive(Default)]
+struct State {
+    source_buffer: String,
+    translated_paths: Vec<PathBuf>,
+    translator: Translator,
+    diagnostics_count: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -417,7 +388,29 @@ enum FileAction {
     Copy,
 }
 
-impl Item<'_, '_> {
+impl FileAction {
+    fn description(self) -> &'static str {
+        match self {
+            FileAction::Translate => "TRANS",
+            FileAction::Copy => "COPY",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Item<'a> {
+    UserInput {
+        path: &'a Path,
+    },
+    ChildItem {
+        name: &'a OsStr,
+        parent_fd_source: &'a File,
+        parent_fd_target: &'a File,
+        parent_item: &'a Item<'a>,
+    },
+}
+
+impl Item<'_> {
     fn file_name(&self) -> Option<&OsStr> {
         match self {
             Item::UserInput { path } => path.file_name(),
@@ -460,16 +453,18 @@ impl Item<'_, '_> {
         }
     }
 
-    fn open(&self) -> Result<Option<File>> {
+    fn open_source(&self) -> Result<Option<File>> {
         Ok(match self {
             Item::UserInput { path } => Some(File::open(path)?),
             Item::ChildItem {
-                parent_fd, name, ..
+                parent_fd_source,
+                name,
+                ..
             } => {
-                let res = fs_at::OpenOptions::default()
+                let res = OpenOptionsAt::default()
                     .read(true)
                     .follow(false)
-                    .open_at(parent_fd, name);
+                    .open_at(parent_fd_source, name);
                 match res {
                     Ok(fd) => Some(fd),
                     // Have to go this way until ErrorKind::FilesystemLoop is stabilized.
@@ -480,73 +475,101 @@ impl Item<'_, '_> {
         })
     }
 
-    fn derive_child_path_buf(&mut self) -> ChildPathBuf<'_> {
-        match self {
-            Item::UserInput { path } => ChildPathBuf::RootPath(path),
+    fn create_target_dir(&self, base: impl AsRef<Path>) -> Result<File> {
+        Ok(match self {
+            Item::UserInput { path } => {
+                // There is no truly race-free way to create the directory and open it. Don't go
+                // overboard here.
+                let target_path = base.as_ref().join(path);
+                std::fs::create_dir_all(&target_path)?;
+                File::open(target_path)?
+            }
             Item::ChildItem {
-                parent_path, name, ..
-            } => parent_path.push_child(name),
-        }
+                name,
+                parent_fd_target,
+                ..
+            } => OpenOptionsAt::default()
+                .create(true)
+                .mkdir_at(parent_fd_target, name)?,
+        })
     }
-}
 
-#[derive(Debug)]
-enum ChildPathBuf<'a> {
-    RootPath(&'a mut PathBuf),
-    ChildPath(&'a mut PathBuf),
-}
+    fn open_target_file(&self, base: impl AsRef<Path>) -> Result<File> {
+        Ok(match self {
+            Item::UserInput { path } => {
+                let target_path = base.as_ref().join(path);
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(target_path)?
+            }
+            Item::ChildItem {
+                name,
+                parent_fd_target,
+                ..
+            } => OpenOptionsAt::default()
+                .write(fs_at::OpenOptionsWriteMode::Write)
+                .create(true)
+                .truncate(true)
+                .open_at(parent_fd_target, name)?,
+        })
+    }
 
-impl ChildPathBuf<'_> {
-    fn get_buf_mut(&mut self) -> &mut PathBuf {
+    fn push_path_cap(&self, path_buf: &mut PathBuf, additional_cap: usize) {
         match self {
-            ChildPathBuf::RootPath(buf) => buf,
-            ChildPathBuf::ChildPath(buf) => buf,
+            Item::UserInput { path } => {
+                path_buf.reserve(path.as_os_str().len() + 1 + additional_cap);
+                path_buf.push(path)
+            }
+            Item::ChildItem {
+                name, parent_item, ..
+            } => {
+                parent_item.push_path_cap(path_buf, additional_cap + 1 + name.len());
+                path_buf.push(name);
+            }
         }
     }
 
-    fn push_child(&mut self, child: impl AsRef<OsStr>) -> ChildPathBuf<'_> {
-        self.get_buf_mut().push(child.as_ref());
-        ChildPathBuf::ChildPath(self.get_buf_mut())
+    fn push_path(&self, path_buf: &mut PathBuf) {
+        self.push_path_cap(path_buf, 0);
     }
-}
 
-impl AsRef<Path> for ChildPathBuf<'_> {
-    fn as_ref(&self) -> &Path {
-        match self {
-            ChildPathBuf::RootPath(buf) => buf,
-            ChildPathBuf::ChildPath(buf) => buf,
-        }
-    }
-}
-
-impl std::ops::Deref for ChildPathBuf<'_> {
-    type Target = Path;
-
-    fn deref(&self) -> &Self::Target {
-        self.as_ref()
-    }
-}
-
-impl Drop for ChildPathBuf<'_> {
-    fn drop(&mut self) {
-        if let ChildPathBuf::ChildPath(buf) = self {
-            let popped = buf.pop();
-            assert!(popped, "ChildPathBuf misused")
-        }
+    fn to_path_buf(self) -> PathBuf {
+        let mut buf = PathBuf::new();
+        self.push_path(&mut buf);
+        buf
     }
 }
 
 impl Agdatex {
+    fn target_path_translated(&self, item_path: impl AsRef<Path>) -> PathBuf {
+        let mut pb = self.temp_dir.join(item_path);
+        pb.set_extension("lagda.tex");
+        pb
+    }
+
+    fn target_path_copied(&self, item_path: impl AsRef<Path>) -> PathBuf {
+        self.temp_dir.join(item_path)
+    }
+
+    fn action_target_path(&self, item_path: impl AsRef<Path>, action: FileAction) -> PathBuf {
+        match action {
+            FileAction::Translate => self.target_path_translated(item_path),
+            FileAction::Copy => self.target_path_copied(item_path),
+        }
+    }
+
     fn run(mut self, cache: &mut Cache, sources: Vec<PathBuf>) -> Result<()> {
         for input_path in sources {
-            self.translate_item(Item::UserInput { path: input_path })?;
+            self.translate_item(Item::UserInput { path: &input_path })?;
         }
 
         Ok(())
     }
 
     fn translate_item(&mut self, item: Item) -> Result<()> {
-        let Some(fd_item) = item.open()? else {
+        let Some(fd_item) = item.open_source()? else {
             return Ok(());
         };
 
@@ -559,8 +582,9 @@ impl Agdatex {
         Ok(())
     }
 
-    fn translate_dir(&mut self, mut parent_item: Item, fd: File) -> Result<()> {
-        let mut path_buf = parent_item.derive_child_path_buf();
+    fn translate_dir(&mut self, parent_item: Item, fd: File) -> Result<()> {
+        // Create the corresponding directory in the target directory.
+        let target_dir_fd = parent_item.create_target_dir(&self.temp_dir)?;
 
         // We need access to `fd` in the loop body. `fs_at::read_dir` wants a &mut to the directory
         // fd. To avoid any unsafe shennanigans we pass a clone of the file descriptor to
@@ -575,42 +599,48 @@ impl Agdatex {
             }
 
             self.translate_item(Item::ChildItem {
-                parent_fd: &fd,
-                parent_path: &mut path_buf,
                 name,
+                parent_fd_source: &fd,
+                parent_fd_target: &target_dir_fd,
+                parent_item: &parent_item,
             })?;
         }
 
         Ok(())
     }
 
-    fn translate_file(&mut self, mut item: Item, mut file: File) -> Result<()> {
+    fn translate_file(&mut self, item: Item, mut file: File) -> Result<()> {
         // Determine what to do with this file based on the extension.
-        //
-        // Skip if neither a .agda or .lagda/.lagda.* file.
         let Some(action) = item.file_action()? else {
-            self.verb
-                .writeln(|| format!("SKIP {}", item.derive_child_path_buf().display()));
+            verb!(self.verb, "SKIP {}", item.to_path_buf().display());
             return Ok(());
         };
 
-        let item_path = item.derive_child_path_buf();
-        let target_path = self.temp_dir.join(&item_path);
-        self.verb.writeln(|| {
-            format!(
-                "{action:?} {} to {}",
-                item_path.display(),
-                target_path.display(),
-            )
-        });
+        let item_path = item.to_path_buf();
+        let target_path = self.action_target_path(&item_path, action);
+        verb!(
+            self.verb,
+            "{} {} ({})",
+            action.description(),
+            item_path.display(),
+            target_path.display()
+        );
 
         match action {
             // A .agda file. Translate annotations into LaTeX macro definitions.
             FileAction::Translate => {
-                self.source_buffer.clear();
-                file.read_to_string(&mut self.source_buffer)?;
-                self.translate_src(&item_path, &target_path)?;
-                Ok(())
+                // Read in source.
+                self.state.source_buffer.clear();
+                file.read_to_string(&mut self.state.source_buffer)?;
+
+                // Open target file.
+                let out_file = item.open_target_file(&self.temp_dir)?;
+
+                // Translate source.
+                let needs_compile = self.translate_src(&item_path, out_file)?;
+                if needs_compile {
+                    self.state.translated_paths.push(target_path);
+                }
             }
 
             // What is the best way to copy the source file untranslated to the temporary
@@ -623,18 +653,66 @@ impl Agdatex {
             //   to the target file. Using `fs_at` we can emulate FD-relative copies.
             //
             // * `libc::linkat` allows FD-relative hard-link creation. But hardlinking may fail if
-            //   our `tempdir` is on another device.
+            //   our `temp_dir` is on another device.
             //
             // For now, we ignore FD-relativity and use `std::fs::copy.
             FileAction::Copy => {
-                std::fs::copy(&item_path, target_path)?;
-                Ok(())
+                std::fs::copy(item_path, target_path)?;
             }
         }
+
+        Ok(())
     }
 
-    fn translate_src(&mut self, path: &Path, target: &Path) -> Result<()> {
-        todo!()
+    fn translate_src(&mut self, item_path: &Path, out_file: File) -> Result<bool> {
+        let pp_path = LazyCell::new(|| item_path.display().to_string());
+        let mut has_macro = false;
+
+        // Run the translator.
+        self.state.translator.run(
+            &self.state.source_buffer,
+            out_file,
+            |diag| {
+                self.state.diagnostics_count += 1;
+                diag.to_report()
+                    .print(NamedSource::new(&self.state.source_buffer, || {
+                        LazyCell::force(&pp_path).clone()
+                    }))
+            },
+            |macro_| {
+                has_macro = true;
+                Ok(())
+            },
+        )?;
+
+        // The file has to be compiled to LaTeX if it contained any macros.
+        Ok(has_macro)
+    }
+}
+
+struct NamedSource<'a, N> {
+    get_name: N,
+    source: ariadne::Source<&'a str>,
+}
+
+impl<'a, N> NamedSource<'a, N> {
+    fn new(source: &'a str, get_name: N) -> Self {
+        NamedSource {
+            get_name,
+            source: source.into(),
+        }
+    }
+}
+
+impl<'a, N: Fn() -> String> ariadne::Cache<()> for NamedSource<'a, N> {
+    type Storage = &'a str;
+
+    fn fetch(&mut self, id: &()) -> Result<&ariadne::Source<Self::Storage>, impl std::fmt::Debug> {
+        self.source.fetch(id)
+    }
+
+    fn display<'x>(&self, _id: &'x ()) -> Option<impl std::fmt::Display + 'x> {
+        Some((self.get_name)())
     }
 }
 
@@ -689,20 +767,6 @@ impl<T: AsRef<str>> std::fmt::Display for PseudoEscape<T> {
             Cow::Borrowed(self.0.as_ref())
         };
         s.fmt(f)
-    }
-}
-
-trait PathExt {
-    fn is_hidden(&self) -> bool;
-}
-
-impl PathExt for Path {
-    fn is_hidden(&self) -> bool {
-        if let Some(name_str) = self.file_name().and_then(OsStr::to_str) {
-            name_str.as_bytes().first() == Some(&b'.')
-        } else {
-            false
-        }
     }
 }
 
