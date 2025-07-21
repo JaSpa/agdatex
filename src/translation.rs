@@ -3,14 +3,30 @@ use std::io::Write;
 use ariadne::ColorGenerator;
 use color_eyre::Result;
 
-use crate::ltx_write::{Group, Ltx};
+use crate::ltx_write::{Group, Ltx, Nat};
 use crate::span_str::{Offset, Span, SpanStr};
 use crate::string_stack::StringStack;
 
+#[derive(Debug, Clone, Copy)]
 pub struct Macro<'a> {
     pub name: &'a str,
     pub line: u32,
     pub inline: bool,
+}
+
+impl<'a> Macro<'a> {
+    fn push_ltx_comment(self, ltx: Ltx<'a, impl Nat>) -> Ltx<'a, impl Nat> {
+        ltx.with_comment(move |l| {
+            l.command(self.name)
+                .push(if self.inline { "" } else { "[*]" })
+        })
+    }
+}
+
+impl std::fmt::Display for Macro<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.push_ltx_comment(Ltx::new()).write_fmt(f)
+    }
 }
 
 #[derive(Default)]
@@ -242,17 +258,18 @@ where
         // Temporarily push the name to the name stack so that we have the full name available as a string
         // slice.
         let name = NameGuard::new(self.namespaces, name);
-        (self.macro_fn)(Macro {
+        let macro_ = Macro {
             name: &name,
             line,
             inline: macro_mode.inline,
-        })?;
+        };
+        (self.macro_fn)(macro_)?;
 
         // Non-inline macros come in a starred and unstarred form. Inline macros do not take any
         // arguments.
         let macro_spec = if macro_mode.inline { "" } else { "s" };
-        let ltx = Ltx::new()
-            .with_comment(|ltx| ltx.command(&name))
+        let ltx = macro_
+            .push_ltx_comment(Ltx::new())
             .command("NewDocumentCommand")
             .command(&name)
             .group(macro_spec)

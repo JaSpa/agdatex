@@ -4,10 +4,10 @@ use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
     fs::{File, OpenOptions},
-    io::Read,
+    io::{Read, Write},
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, ExitStatus},
 };
 
 use base64::prelude::*;
@@ -17,6 +17,7 @@ use color_eyre::{
     eyre::{Context, eyre},
 };
 use fs_at::OpenOptions as OpenOptionsAt;
+use ltx_write::Ltx;
 use merde::MerdeError;
 use sha2::{
     Sha256,
@@ -63,19 +64,10 @@ struct Args {
     #[arg(short, long = "outputdir", default_value = "latex")]
     output_dir: PathBuf,
 
-    /// This file will `\input` all generated .tex files. Both .tex and .sty are supported.
-    /// [default: `<OUTPUTDIR>/agda-generated.sty`]
-    #[arg(short, long = "exportfile")]
-    export_file: Option<PathBuf>,
-
-    /// Temporary directory to copy the project root to. (default: fresh system-dependent temporary
-    /// directory.
+    /// Temporary directory to copy the project root to. [default: fresh system-dependent
+    /// directory]
     #[arg(short, long = "tempdir")]
     temp_dir: Option<PathBuf>,
-
-    /// Write the list of generated macros to this file.
-    #[arg(short, long)]
-    index: Option<PathBuf>,
 
     /// Enable verbose output.
     #[arg(short, long)]
@@ -225,8 +217,6 @@ fn main() -> Result<()> {
     let resolved_args = Agdatex {
         verb,
         output_dir: args.output_dir,
-        export_file: args.export_file,
-        index: args.index,
         temp_dir: if let Some(tmp) = args.temp_dir {
             tmp
         } else {
@@ -367,8 +357,6 @@ type Cache<'a> = HashMap<CachePath<Cow<'a, Path>>, CacheEntry>;
 
 struct Agdatex {
     output_dir: PathBuf,
-    export_file: Option<PathBuf>,
-    index: Option<PathBuf>,
     temp_dir: PathBuf,
     verb: VerbOutput,
     state: State,
@@ -380,6 +368,7 @@ struct State {
     translated_paths: Vec<PathBuf>,
     translator: Translator,
     diagnostics_count: u32,
+    cur_assemble_file: Option<File>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -561,8 +550,28 @@ impl Agdatex {
     }
 
     fn run(mut self, cache: &mut Cache, sources: Vec<PathBuf>) -> Result<()> {
+        // Ensure the output directory exists.
+        std::fs::create_dir_all(&self.output_dir)?;
+
+        // Translate all the inputs recursively.
         for input_path in sources {
             self.translate_item(Item::UserInput { path: &input_path })?;
+            self.state.cur_assemble_file = None;
+        }
+
+        // Build the `--latex-dir=..` argument once.
+        let mut latex_dir_arg = OsString::from("--latex-dir=");
+        latex_dir_arg.push(std::path::absolute(&self.output_dir)?);
+
+        // Compile all the translated files to LaTeX.
+        for translated in self.state.translated_paths {
+            Command::new("agda")
+                .current_dir(&self.temp_dir)
+                .arg("--only-scope-checking")
+                .arg("--latex")
+                .arg(&latex_dir_arg)
+                .arg(translated)
+                .expect_run()?;
         }
 
         Ok(())
@@ -585,6 +594,21 @@ impl Agdatex {
     fn translate_dir(&mut self, parent_item: Item, fd: File) -> Result<()> {
         // Create the corresponding directory in the target directory.
         let target_dir_fd = parent_item.create_target_dir(&self.temp_dir)?;
+
+        // If we are translating a directory we have to create an assembly file if there is not
+        // one already.
+        if self.state.cur_assemble_file.is_none() {
+            let mut path = self.output_dir.clone();
+            parent_item.push_path(&mut path);
+            path.set_extension("tex");
+            self.state.cur_assemble_file = Some(
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(path)?,
+            );
+        }
 
         // We need access to `fd` in the loop body. `fs_at::read_dir` wants a &mut to the directory
         // fd. To avoid any unsafe shennanigans we pass a clone of the file descriptor to
@@ -681,9 +705,21 @@ impl Agdatex {
             },
             |macro_| {
                 has_macro = true;
+                if let Some(ref mut file) = self.state.cur_assemble_file {
+                    write!(file, "{macro_}")?;
+                }
                 Ok(())
             },
         )?;
+
+        if has_macro && let Some(ref file) = self.state.cur_assemble_file {
+            Ltx::new()
+                .command("input")
+                .group(&item_path.as_os_str().to_string_lossy())
+                .ln()
+                .ln()
+                .write(file)?;
+        }
 
         // The file has to be compiled to LaTeX if it contained any macros.
         Ok(has_macro)
@@ -717,12 +753,50 @@ impl<'a, N: Fn() -> String> ariadne::Cache<()> for NamedSource<'a, N> {
 }
 
 pub trait CommandSuccess {
+    fn expect_success<R>(
+        &self,
+        result: std::io::Result<R>,
+        get_status: impl FnOnce(&R) -> ExitStatus,
+        customize_error: impl FnOnce(color_eyre::Report, R) -> color_eyre::Report,
+    ) -> Result<R>;
+
+    fn expect_run(&mut self) -> Result<()>;
     fn success_output(&mut self) -> Result<std::process::Output>;
 }
 
 impl CommandSuccess for Command {
-    fn success_output(&mut self) -> Result<std::process::Output> {
+    fn expect_success<R>(
+        &self,
+        result: std::io::Result<R>,
+        get_status: impl FnOnce(&R) -> ExitStatus,
+        customize_error: impl FnOnce(color_eyre::Report, R) -> color_eyre::Report,
+    ) -> Result<R> {
         let cmd_section = |cmd: &Command| format!("{cmd:?}").header("Command");
+        let result = result
+            .wrap_err("process invocation failed")
+            .with_section(|| cmd_section(self))?;
+
+        let status = get_status(&result);
+        if status.success() {
+            return Ok(result);
+        }
+
+        let report = eyre!(
+            "command {} failed with exit code {}",
+            PseudoEscape(self.get_program().to_string_lossy()),
+            status
+        )
+        .section(cmd_section(self));
+        Err(customize_error(report, result))
+    }
+
+    fn expect_run(&mut self) -> Result<()> {
+        let result = self.spawn().and_then(|mut child| child.wait());
+        self.expect_success(result, |exit| *exit, |report, _| report)?;
+        Ok(())
+    }
+
+    fn success_output(&mut self) -> Result<std::process::Output> {
         let with_out_section = |report: color_eyre::Report, header: &'static str, out: &[u8]| {
             if out.is_empty() {
                 report
@@ -730,25 +804,16 @@ impl CommandSuccess for Command {
                 report.section(String::from_utf8_lossy(out).into_owned().header(header))
             }
         };
-
-        let out = self
-            .output()
-            .wrap_err("process invocation failed")
-            .with_section(|| cmd_section(self))?;
-
-        if out.status.success() {
-            return Ok(out);
-        }
-
-        let mut report = eyre!(
-            "command {} failed with exit code {}",
-            PseudoEscape(self.get_program().to_string_lossy()),
-            out.status
+        let result = self.output();
+        self.expect_success(
+            result,
+            |out| out.status,
+            |mut report, out| {
+                report = with_out_section(report, "Stdout", &out.stdout);
+                report = with_out_section(report, "Stderr", &out.stderr);
+                report
+            },
         )
-        .section(cmd_section(self));
-        report = with_out_section(report, "Stdout", &out.stdout);
-        report = with_out_section(report, "Stderr", &out.stderr);
-        Err(report)
     }
 }
 
