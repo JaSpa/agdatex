@@ -11,10 +11,12 @@ impl StringStack {
         Self::default()
     }
 
+    #[cfg_attr(not(test), allow(unused))]
     pub fn len(&self) -> usize {
         self.lens.len()
     }
 
+    #[cfg_attr(not(test), allow(unused))]
     pub fn is_empty(&self) -> bool {
         self.lens.is_empty()
     }
@@ -33,12 +35,14 @@ impl StringStack {
         self.data.push_str(s);
     }
 
+    #[cfg_attr(not(test), allow(unused))]
     pub fn top(&self) -> Option<&str> {
         self.lens
             .last()
             .map(|&len| unsafe { self.data.get_unchecked(len..) })
     }
 
+    #[cfg_attr(not(test), allow(unused))]
     pub fn top_mut(&mut self) -> Option<&mut str> {
         self.lens
             .last()
@@ -332,5 +336,31 @@ mod test {
         stack.extend(strs!());
         assert!(!stack.is_empty());
         assert_eq!(stack.len(), strs!().len());
+    }
+
+    #[test]
+    fn top_mut() {
+        const STR1: &str = "hi";
+        const STR2: &str = "there";
+
+        let mut stack = StringStack::new();
+
+        assert_eq!(stack.top(), None);
+        assert_eq!(stack.top_mut(), None);
+
+        stack.push("hi");
+        assert_eq!(stack.top(), Some(STR1));
+
+        stack.push(STR2);
+        assert_eq!(stack.top(), Some(STR2));
+
+        let Some(top_mut) = stack.top_mut() else {
+            panic!("no top element");
+        };
+        top_mut.make_ascii_uppercase();
+
+        let str2_upper = STR2.to_ascii_uppercase();
+        assert_eq!(stack.top(), Some(str2_upper.as_str()));
+        assert_eq!(stack.as_str(), &format!("{STR1}{str2_upper}"));
     }
 }
