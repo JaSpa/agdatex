@@ -107,6 +107,11 @@ impl<'s, N: Nat> Ltx<'s, N> {
         self.push("%\n")
     }
 
+    #[cfg_attr(not(test), allow(unused))]
+    pub fn par(self) -> Ltx<'s, Add2<N>> {
+        self.ln().ln()
+    }
+
     pub fn command(self, cmd: &'s str) -> Ltx<'s, Add2<N>> {
         self.push("\\").push(cmd)
     }
@@ -131,12 +136,21 @@ impl<'s, N: Nat> Ltx<'s, N> {
         self.command("begin").group(env).opt(arg)
     }
 
-    pub fn begin_(self, env: &'s str) -> Ltx<'s, impl Nat> {
+    pub fn begin_(self, env: &'s str) -> Ltx<'s, Add5<N>> {
         self.command("begin").group(env)
     }
 
     pub fn end(self, env: &'s str) -> Ltx<'s, Add5<N>> {
         self.command("end").group(env)
+    }
+
+    #[cfg_attr(not(test), allow(unused))]
+    pub fn with_env<M: Nat>(
+        self,
+        env: &'s str,
+        f: impl FnOnce(Ltx<'s, Add5<N>>) -> Ltx<'s, M>,
+    ) -> Ltx<'s, Add5<M>> {
+        f(self.begin_(env)).end(env)
     }
 
     pub fn with_comment<M: Nat>(
@@ -200,4 +214,42 @@ fn write_vectored_all(mut writer: impl io::Write, mut bufs: &mut [IoSlice<'_>]) 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write() {
+        let expected_lines = [
+            r"\documentclass[ngerman]{scrartcl}",
+            r"\usepackage{blindtext}",
+            r"",
+            r"\begin{document}",
+            r"Hi!",
+            r"",
+            r"\blindtext",
+            r"\end{document}",
+        ];
+        let ltx = Ltx::new()
+            .command("documentclass")
+            .opt("ngerman")
+            .group("scrartcl")
+            .ln()
+            .command("usepackage")
+            .group("blindtext")
+            .par()
+            .with_env("document", |ltx| {
+                ltx.ln().push("Hi!").par().command("blindtext").ln()
+            })
+            .ln();
+        let actual = ltx.to_string();
+        let actual_lines = actual.lines().collect::<Vec<_>>();
+
+        assert_eq!(expected_lines.len(), actual_lines.len());
+        for (i, (expected, actual)) in expected_lines.into_iter().zip(actual_lines).enumerate() {
+            assert_eq!(expected, actual, "mismatch in line #{}", i + 1);
+        }
+    }
 }
