@@ -22,8 +22,6 @@ impl PartialEq<SpanStr<'_>> for str {
 }
 
 impl<'s> SpanStr<'s> {
-    const EMPTY: Self = Self::new("");
-
     /// Returns a string with its span starting at byte position zero.
     pub const fn new(str: &'s str) -> Self {
         Self { str, offset: 0 }
@@ -109,19 +107,6 @@ impl<'s> SpanStr<'s> {
         let start = range.start_bound().cloned();
         let end = range.end_bound().cloned();
         self.mk_offset_slice(start, &self.str[(start, end)])
-    }
-
-    /// # Safety
-    ///
-    /// `range` must be a valid range for [`Self::as_str()`].
-    unsafe fn get_unchecked(self, range: impl RangeBounds<usize>) -> Self {
-        let start = range.start_bound().cloned();
-        let end = range.end_bound().cloned();
-
-        // SAFETY: function safety contract.
-        let str = unsafe { self.str.get_unchecked((start, end)) };
-
-        self.mk_offset_slice(start, str)
     }
 
     fn mk_offset_slice<'a>(self, start: Bound<usize>, str: &'a str) -> SpanStr<'a> {
