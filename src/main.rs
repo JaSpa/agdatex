@@ -4,10 +4,10 @@ use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
     fs::{File, OpenOptions},
-    io::Read,
+    io::{Read, Write},
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
-    process::{Command, ExitStatus},
+    process::{Command, ExitCode, ExitStatus},
 };
 
 use base64::prelude::*;
@@ -192,7 +192,45 @@ fn with_cache<R: 'static>(
     Ok(result)
 }
 
-fn main() -> Result<()> {
+fn translate_stdin(_args: Args) -> Result<ExitCode> {
+    let mut src = String::new();
+    std::io::stdin().read_to_string(&mut src)?;
+    let mut translated = Vec::new();
+    let mut macros = Vec::new();
+    let mut errors = false;
+
+    Translator::default().run(
+        &src,
+        &mut translated,
+        |diag| {
+            errors = true;
+            diag.to_report().eprint(NamedSource {
+                name: "«stdin»",
+                source: src.as_str().into(),
+            })
+        },
+        |macro_| {
+            macros.push(macro_.to_owned());
+            Ok(())
+        },
+    )?;
+
+    if errors {
+        return Ok(ExitCode::FAILURE);
+    }
+
+    // Write the translated source to stdout.
+    std::io::stdout().write_all(&translated)?;
+
+    // Print the macros to stderr.
+    for macro_ in macros {
+        eprint!("{macro_}");
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+fn main() -> Result<ExitCode> {
     color_eyre::install().unwrap();
 
     let args = Args::parse();
@@ -201,7 +239,7 @@ fn main() -> Result<()> {
     };
 
     if args.sources.is_empty() {
-        return Err(eyre!("no inputs given"));
+        return translate_stdin(args);
     }
     verb!(verb, "Command line options: {args:#?}");
 
@@ -234,11 +272,11 @@ fn main() -> Result<()> {
         resolved_args.temp_dir.display()
     );
 
-    let result = with_cache(!args.clear, verb, |cache| resolved_args.run(cache, sources));
+    with_cache(!args.clear, verb, |cache| resolved_args.run(cache, sources))?;
 
     // Make sure the temporary directory is dropped at the very end.
     std::mem::drop(tmp_dir);
-    result
+    Ok(ExitCode::SUCCESS)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -709,10 +747,10 @@ impl Agdatex {
             out_file,
             |diag| {
                 self.state.diagnostics_count += 1;
-                diag.to_report()
-                    .print(NamedSource::new(&self.state.source_buffer, || {
-                        LazyCell::force(&pp_path).clone()
-                    }))
+                diag.to_report().print(NamedSource {
+                    name: pp_path.as_str(),
+                    source: self.state.source_buffer.as_str().into(),
+                })
             },
             |macro_| {
                 has_macro = true;
@@ -737,21 +775,12 @@ impl Agdatex {
     }
 }
 
-struct NamedSource<'a, N> {
-    get_name: N,
+struct NamedSource<'a> {
+    name: &'a str,
     source: ariadne::Source<&'a str>,
 }
 
-impl<'a, N> NamedSource<'a, N> {
-    fn new(source: &'a str, get_name: N) -> Self {
-        NamedSource {
-            get_name,
-            source: source.into(),
-        }
-    }
-}
-
-impl<'a, N: Fn() -> String> ariadne::Cache<()> for NamedSource<'a, N> {
+impl<'a> ariadne::Cache<()> for NamedSource<'a> {
     type Storage = &'a str;
 
     fn fetch(&mut self, id: &()) -> Result<&ariadne::Source<Self::Storage>, impl std::fmt::Debug> {
@@ -759,7 +788,7 @@ impl<'a, N: Fn() -> String> ariadne::Cache<()> for NamedSource<'a, N> {
     }
 
     fn display<'x>(&self, _id: &'x ()) -> Option<impl std::fmt::Display + 'x> {
-        Some((self.get_name)())
+        Some(self.name.to_owned())
     }
 }
 

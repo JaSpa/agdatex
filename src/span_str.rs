@@ -149,28 +149,114 @@ impl std::fmt::Display for SpanStr<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndTrim {
+    None,
+    Nl,
+    CrNl,
+}
+
+impl std::ops::Add<EndTrim> for usize {
+    type Output = usize;
+    fn add(self, rhs: EndTrim) -> Self::Output {
+        match rhs {
+            EndTrim::None => self,
+            EndTrim::Nl => self + 1,
+            EndTrim::CrNl => self + 2,
+        }
+    }
+}
+
+impl std::ops::AddAssign<EndTrim> for usize {
+    fn add_assign(&mut self, rhs: EndTrim) {
+        *self = *self + rhs;
+    }
+}
+
+fn trim_maybe_cr(s: &mut &str) -> EndTrim {
+    if let Some(s_trimmed) = s.strip_suffix('\r') {
+        *s = s_trimmed;
+        EndTrim::CrNl
+    } else {
+        EndTrim::Nl
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Line<'s> {
+    str: SpanStr<'s>,
+    end_trim: EndTrim,
+}
+
+impl<'s> Line<'s> {
+    fn unterminated(str: SpanStr<'s>) -> Self {
+        Line {
+            str,
+            end_trim: EndTrim::None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_nl(str: SpanStr<'s>) -> Self {
+        Line {
+            str,
+            end_trim: EndTrim::Nl,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_crnl(str: SpanStr<'s>) -> Self {
+        Line {
+            str,
+            end_trim: EndTrim::CrNl,
+        }
+    }
+
+    pub fn as_str(self) -> &'s str {
+        self.str.as_str()
+    }
+
+    pub fn as_span_str(self) -> SpanStr<'s> {
+        self.str
+    }
+
+    pub fn str_span(self) -> Span {
+        self.str.span()
+    }
+
+    pub fn line_span(self) -> Span {
+        let mut span = self.str.span();
+        span.end += self.end_trim;
+        span
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Lines<'s>(SpanStr<'s>);
 
 impl<'s> Iterator for Lines<'s> {
-    type Item = SpanStr<'s>;
+    type Item = Line<'s>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let Lines(s) = *self;
-        if s.is_empty() {
+        let Lines(str) = *self;
+        if str.is_empty() {
             None
-        } else if let Some((ln, rest)) = s.str.split_once('\n') {
+        } else if let Some((mut ln, rest)) = str.str.split_once('\n') {
             *self = Lines(SpanStr {
                 str: rest,
-                offset: s.offset + ln.len() + 1,
+                offset: str.offset + ln.len() + 1,
             });
-            Some(SpanStr {
-                str: ln.strip_suffix('\r').unwrap_or(ln),
-                offset: s.offset,
+            let end_trim = trim_maybe_cr(&mut ln);
+            Some(Line {
+                str: SpanStr {
+                    str: ln,
+                    offset: str.offset,
+                },
+                end_trim,
             })
         } else {
             self.0.str = "";
-            Some(s)
+            Some(Line::unterminated(str))
         }
     }
 
@@ -192,8 +278,10 @@ impl DoubleEndedIterator for Lines<'_> {
             return None;
         }
 
-        if let Some(str_no_nl) = str.strip_suffix('\n') {
-            str = str_no_nl.strip_suffix('\r').unwrap_or(str_no_nl);
+        let mut end_trim = EndTrim::None;
+        if let Some(mut str_no_nl) = str.strip_suffix('\n') {
+            end_trim = trim_maybe_cr(&mut str_no_nl);
+            str = str_no_nl;
         }
 
         // We can't use `str::rsplit_once` here, because we want to keep the separator around in
@@ -212,9 +300,12 @@ impl DoubleEndedIterator for Lines<'_> {
         };
 
         self.0.str = prev;
-        Some(SpanStr {
-            str: line,
-            offset: offset + prev.len(),
+        Some(Line {
+            str: SpanStr {
+                str: line,
+                offset: offset + prev.len(),
+            },
+            end_trim,
         })
     }
 }
@@ -226,10 +317,10 @@ mod tests {
     #[test]
     fn lines_empty() {
         let lines = Vec::from_iter(SpanStr::new("").lines());
-        assert_eq!(lines, vec![] as Vec<SpanStr<'_>>);
+        assert_eq!(lines, vec![] as Vec<Line>);
 
         let rev_lines = Vec::from_iter(SpanStr::new("").lines().rev());
-        assert_eq!(rev_lines, vec![] as Vec<SpanStr<'_>>);
+        assert_eq!(rev_lines, vec![] as Vec<Line>);
     }
 
     #[test]
@@ -239,10 +330,16 @@ mod tests {
             let str = SpanStr::new(LINE);
 
             let lines = Vec::from_iter(str.lines());
-            assert_eq!(lines, vec![SpanStr::with_offset(LINE, 0)]);
+            assert_eq!(
+                lines,
+                vec![Line::unterminated(SpanStr::with_offset(LINE, 0))]
+            );
 
             let rev_lines = Vec::from_iter(str.lines().rev());
-            assert_eq!(rev_lines, vec![SpanStr::with_offset(LINE, 0)]);
+            assert_eq!(
+                rev_lines,
+                vec![Line::unterminated(SpanStr::with_offset(LINE, 0))]
+            );
         }
 
         {
@@ -250,10 +347,16 @@ mod tests {
             let str = SpanStr::new(LINE);
 
             let lines = Vec::from_iter(str.lines());
-            assert_eq!(lines, vec![SpanStr::with_offset(LINE, 0)]);
+            assert_eq!(
+                lines,
+                vec![Line::unterminated(SpanStr::with_offset(LINE, 0))]
+            );
 
             let rev_lines = Vec::from_iter(str.lines().rev());
-            assert_eq!(rev_lines, vec![SpanStr::with_offset(LINE, 0)]);
+            assert_eq!(
+                rev_lines,
+                vec![Line::unterminated(SpanStr::with_offset(LINE, 0))]
+            );
         }
     }
 
@@ -266,10 +369,13 @@ mod tests {
             let str = SpanStr::new(&str);
 
             let lines = Vec::from_iter(str.lines());
-            assert_eq!(lines, vec![SpanStr::with_offset(LINE, 0)]);
+            assert_eq!(lines, vec![Line::with_nl(SpanStr::with_offset(LINE, 0))]);
 
             let rev_lines = Vec::from_iter(str.lines().rev());
-            assert_eq!(rev_lines, vec![SpanStr::with_offset(LINE, 0)]);
+            assert_eq!(
+                rev_lines,
+                vec![Line::with_nl(SpanStr::with_offset(LINE, 0))]
+            );
         }
 
         {
@@ -277,10 +383,13 @@ mod tests {
             let str = SpanStr::new(&str);
 
             let lines = Vec::from_iter(str.lines());
-            assert_eq!(lines, vec![SpanStr::with_offset(LINE, 0)]);
+            assert_eq!(lines, vec![Line::with_crnl(SpanStr::with_offset(LINE, 0))]);
 
             let rev_lines = Vec::from_iter(str.lines().rev());
-            assert_eq!(rev_lines, vec![SpanStr::with_offset(LINE, 0)]);
+            assert_eq!(
+                rev_lines,
+                vec![Line::with_crnl(SpanStr::with_offset(LINE, 0))]
+            );
         }
     }
 
@@ -295,13 +404,20 @@ mod tests {
             "JKLMNOPQ"
         ];
 
-        let lines_spanned = lines
+        let mut lines_spanned = lines
             .iter()
             .enumerate()
-            .map(|(i, ln)| SpanStr::with_offset(ln, i * 10))
+            .map(|(i, ln)| Line::with_crnl(SpanStr::with_offset(ln, i * 10)))
             .collect::<Vec<_>>();
+
+        // Because we use `slice::join` below, all lines  in the middle are terminated by `\r\n`
+        // but the last line has no end trim.
+        lines_spanned.last_mut().unwrap().end_trim = EndTrim::None;
+
+        // Collect the lines in reverse order as well.
         let lines_spanned_rev = lines_spanned.iter().rev().copied().collect::<Vec<_>>();
 
+        // Check iteration forwards and backwards.
         let str = lines.join("\r\n");
         assert_eq!(Vec::from_iter(SpanStr::new(&str).lines()), lines_spanned);
         assert_eq!(
@@ -309,6 +425,7 @@ mod tests {
             lines_spanned_rev
         );
 
+        // Check iteration switching between front and back access.
         let mut iter = SpanStr::new(&str).lines();
         assert_eq!(iter.next(), Some(lines_spanned[0]));
         assert_eq!(iter.next_back(), Some(lines_spanned_rev[0]));

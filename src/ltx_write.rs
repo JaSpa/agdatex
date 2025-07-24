@@ -61,7 +61,7 @@ impl<N: Nat> Clone for Ltx<'_, N> {
 }
 
 impl<'s> Ltx<'s, Z> {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Ltx { slices: () }
     }
 }
@@ -184,6 +184,7 @@ impl<N: Nat> fmt::Display for Ltx<'_, N> {
 }
 
 fn write_vectored_all(mut writer: impl io::Write, mut bufs: &mut [IoSlice<'_>]) -> io::Result<()> {
+    // The initial `advance_slices` call skips over any empty slices at the start of `bufs`.
     IoSlice::advance_slices(&mut bufs, 0);
     while !bufs.is_empty() {
         match writer.write_vectored(bufs) {

@@ -4,30 +4,47 @@ use ariadne::ColorGenerator;
 use color_eyre::Result;
 
 use crate::ltx_write::{Group, Ltx, Nat};
-use crate::span_str::{Offset, Span, SpanStr};
+use crate::span_str::{Span, SpanStr};
 use crate::string_stack::StringStack;
 
 #[derive(Debug, Clone, Copy)]
-pub struct Macro<'a> {
-    pub name: &'a str,
+pub struct Macro<S> {
+    pub name: S,
     pub line: u32,
     pub inline: bool,
 }
 
-impl<'a> Macro<'a> {
-    pub fn to_ltx_comment(self) -> Ltx<'a, impl Nat> {
+impl<S> Macro<S> {
+    pub fn to_ltx_comment(&self) -> Ltx<'_, impl Nat>
+    where
+        S: AsRef<str>,
+    {
         self.push_ltx_comment(Ltx::new())
     }
 
-    pub fn push_ltx_comment(self, ltx: Ltx<'a, impl Nat>) -> Ltx<'a, impl Nat> {
+    pub fn push_ltx_comment<'a>(&'a self, ltx: Ltx<'a, impl Nat>) -> Ltx<'a, impl Nat>
+    where
+        S: AsRef<str>,
+    {
         ltx.with_comment(move |l| {
-            l.command(self.name)
+            l.command(self.name.as_ref())
                 .push(if self.inline { "" } else { "[*]" })
         })
     }
+
+    pub fn to_owned(&self) -> Macro<String>
+    where
+        S: AsRef<str>,
+    {
+        Macro {
+            name: self.name.as_ref().to_owned(),
+            line: self.line,
+            inline: self.inline,
+        }
+    }
 }
 
-impl std::fmt::Display for Macro<'_> {
+impl<S: AsRef<str>> std::fmt::Display for Macro<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.to_ltx_comment().write_fmt(f)
     }
@@ -45,12 +62,12 @@ impl Translator {
     pub fn run(
         &mut self,
         src: &str,
-        writer: impl Write,
+        mut writer: impl Write,
         diag_fn: impl FnMut(Diagnostic) -> std::io::Result<()>,
-        macro_fn: impl FnMut(Macro) -> std::io::Result<()>,
+        macro_fn: impl FnMut(Macro<&str>) -> std::io::Result<()>,
     ) -> Result<()> {
         let mut translation = Translation::new(
-            writer,
+            &mut writer,
             diag_fn,
             macro_fn,
             &mut self.namespaces,
@@ -59,16 +76,18 @@ impl Translator {
 
         let src = SpanStr::new(src);
         for (line_no, line) in src.lines().enumerate() {
+            let line_span = line.line_span();
+            let line = line.as_span_str();
             let trimmed = line.trim();
             if trimmed.is_empty() {
-                translation.add_empty_line(line.span().start)?;
+                translation.add_empty_line(line_span)?;
                 continue;
             }
 
             match Command::try_parse(trimmed) {
                 CommandParseResult::NotACommand => {
                     // Preserve line verbatim.
-                    translation.add_verbatim(line)?;
+                    translation.add_verbatim(line.as_str(), line_span, true)?;
                     continue;
                 }
                 CommandParseResult::InvalidCommand => {
@@ -76,7 +95,7 @@ impl Translator {
                     translation.diagnose(Diagnostic::InvalidCommand {
                         command_span: trimmed.span(),
                     })?;
-                    translation.add_verbatim(line)?;
+                    translation.add_verbatim(line.as_str(), line_span, true)?;
                 }
                 CommandParseResult::Command {
                     command,
@@ -103,12 +122,13 @@ impl Translator {
             }
         }
 
+        translation.transition_to_none_mode(src.span().end..src.span().end, true)?;
         Ok(())
     }
 }
 
-struct Translation<'a, W, D, M> {
-    output: W,
+struct Translation<'a, D, M> {
+    output: &'a mut dyn Write,
     diag_fn: D,
     macro_fn: M,
     mode: Mode,
@@ -117,9 +137,9 @@ struct Translation<'a, W, D, M> {
     prev_autoclose_macro: Option<Span>,
 }
 
-impl<'a, W, D, M> Translation<'a, W, D, M> {
+impl<'a, D, M> Translation<'a, D, M> {
     fn new(
-        output: W,
+        output: &'a mut dyn Write,
         diag_fn: D,
         macro_fn: M,
         namespaces: &'a mut StringStack,
@@ -139,18 +159,27 @@ impl<'a, W, D, M> Translation<'a, W, D, M> {
     }
 }
 
-impl<W, D, M> Translation<'_, W, D, M>
+fn union_span(dst: &mut Option<Span>, span: Span) {
+    match dst {
+        Some(s) => {
+            s.start = s.start.min(span.start);
+            s.end = s.end.max(span.end);
+        }
+        None => *dst = Some(span),
+    }
+}
+
+impl<D, M> Translation<'_, D, M>
 where
-    W: Write,
     D: FnMut(Diagnostic) -> std::io::Result<()>,
-    M: FnMut(Macro) -> std::io::Result<()>,
+    M: FnMut(Macro<&str>) -> std::io::Result<()>,
 {
     fn diagnose(&mut self, diagnostic: Diagnostic) -> Result<()> {
         (self.diag_fn)(diagnostic)?;
         Ok(())
     }
 
-    fn add_empty_line(&mut self, offset: Offset) -> Result<()> {
+    fn add_empty_line(&mut self, line_span: Span) -> Result<()> {
         if matches!(
             self.mode,
             Mode::Macro(MacroMode {
@@ -158,16 +187,16 @@ where
                 ..
             })
         ) {
-            self.close_macro(false, offset..offset + 1)?;
+            self.close_macro(false, line_span)?;
         } else {
-            writeln!(self.output)?;
+            self.add_verbatim("", line_span, false)?;
         }
         Ok(())
     }
 
-    fn add_verbatim(&mut self, line: SpanStr) -> Result<()> {
+    fn add_verbatim(&mut self, line: &str, line_span: Span, need_hide: bool) -> Result<()> {
         match self.mode {
-            Mode::None => {
+            Mode::None if need_hide => {
                 self.mode = Mode::Hide;
                 Ltx::new()
                     .begin("code", "hide")
@@ -175,12 +204,48 @@ where
                     .write(&mut self.output)?;
             }
             Mode::Macro(ref mut macro_mode) => {
-                macro_mode.body.get_or_insert(line.span()).end = line.span().end;
+                union_span(&mut macro_mode.body, line_span);
             }
             _ => {}
         }
 
+        self.ensure_correct_macro_mode()?;
         writeln!(self.output, "{line}")?;
+
+        Ok(())
+    }
+
+    fn ensure_correct_macro_mode(&mut self) -> Result<()> {
+        let Mode::Macro(ref mut macro_mode) = self.mode else {
+            return Ok(());
+        };
+
+        let hide = !self.hide_stack.is_empty();
+        if hide && matches!(macro_mode.inner_mode, Mode::Hide)
+            || !hide && matches!(macro_mode.inner_mode, Mode::Macro(_))
+        {
+            return Ok(());
+        }
+
+        fn push_code_begin<'a>(
+            ltx: Ltx<'a, impl Nat>,
+            code_arg: &'static str,
+        ) -> Ltx<'a, impl Nat> {
+            ltx.begin("code", code_arg).ln()
+        }
+
+        let code_arg = if hide { "hide" } else { "" };
+        match macro_mode.inner_mode {
+            Mode::None => {
+                push_code_begin(Ltx::new(), code_arg).write(&mut self.output)?;
+            }
+            Mode::Hide | Mode::Macro(_) => {
+                push_code_begin(Ltx::new().end("code").pctln(), code_arg)
+                    .write(&mut self.output)?;
+            }
+        }
+
+        macro_mode.inner_mode = if hide { Mode::Hide } else { Mode::Macro(()) };
         Ok(())
     }
 
@@ -199,6 +264,7 @@ where
                     body: None,
                     inline,
                     auto_close,
+                    inner_mode: Mode::None,
                 },
             )?,
             Command::MacroEnd(span) => {
@@ -212,7 +278,6 @@ where
                     self.diagnose(Diagnostic::NoNamespaceToClose { close_span: span })?;
                 }
             }
-
             Command::HideStart(span) => {
                 self.hide_stack.push(span);
             }
@@ -227,9 +292,15 @@ where
     }
 
     fn start_macro(&mut self, name: &str, line: u32, macro_mode: MacroMode) -> Result<()> {
+        assert_eq!(
+            macro_mode.inner_mode,
+            Mode::None,
+            "macros need to start in `Mode::None`"
+        );
+
         // Ensure we aren't currently inside another macro and end any currently open
         // `\begin{code}[hide]` environments.
-        self.transition_to_none_mode(macro_mode.start.clone())?;
+        self.transition_to_none_mode(macro_mode.start.clone(), false)?;
 
         struct NameGuard<'a>(&'a mut StringStack);
 
@@ -263,7 +334,7 @@ where
         // Temporarily push the name to the name stack so that we have the full name available as a string
         // slice.
         let name = NameGuard::new(self.namespaces, name);
-        let macro_ = Macro {
+        let macro_: Macro<&str> = Macro {
             name: &name,
             line,
             inline: macro_mode.inline,
@@ -282,7 +353,7 @@ where
             .pctln();
 
         if macro_mode.inline {
-            ltx.begin("code", "inline").ln().write(&mut self.output)?;
+            ltx.write(&mut self.output)?;
         } else {
             ltx.command("IfBooleanF")
                 .group("#1")
@@ -290,8 +361,6 @@ where
                     ltx.begin_("AgdaSuppressSpace").begin_("AgdaAlign")
                 })
                 .pctln()
-                .begin_("code")
-                .ln()
                 .write(&mut self.output)?;
         }
 
@@ -300,7 +369,7 @@ where
         Ok(())
     }
 
-    fn transition_to_none_mode(&mut self, span: Span) -> Result<()> {
+    fn transition_to_none_mode(&mut self, span: Span, file_end: bool) -> Result<()> {
         match std::mem::replace(&mut self.mode, Mode::None) {
             // Nothing to do.
             Mode::None => {}
@@ -312,12 +381,34 @@ where
 
             // Diagnose the open macro and close it.
             Mode::Macro(macro_mode) => {
-                self.diagnose(Diagnostic::OpenMacro {
-                    cur_start_span: macro_mode.start.clone(),
-                    cur_macro_span: macro_mode.body.clone(),
-                    new_start_span: span,
-                })?;
-                self.close_macro_mode(macro_mode, CloseMode::Forced)?;
+                // Don't diagnose if it is a auto-close macro and the end of the file.
+                let auto_at_end = macro_mode.auto_close && file_end;
+                if !auto_at_end {
+                    let cur_start_span = macro_mode.start.clone();
+                    let cur_macro_span = macro_mode.body.clone();
+                    let dia = if file_end {
+                        Diagnostic::UnfinishedMacro {
+                            cur_start_span,
+                            cur_macro_span,
+                            file_end_span: span,
+                        }
+                    } else {
+                        Diagnostic::OpenMacro {
+                            cur_start_span,
+                            cur_macro_span,
+                            new_start_span: span,
+                        }
+                    };
+                    self.diagnose(dia)?;
+                }
+
+                // We're at the end of the file or forced the macro end.
+                self.prev_autoclose_macro = None;
+                // Swallow any unclosed hides.
+                self.hide_stack.clear();
+
+                // Emit the close code.
+                self.emit_macro_close(macro_mode)?;
             }
         }
 
@@ -327,12 +418,33 @@ where
     fn close_macro(&mut self, explicit: bool, span: Span) -> Result<()> {
         match std::mem::take(&mut self.mode) {
             Mode::Macro(macro_) => {
-                let close_mode = if explicit {
-                    CloseMode::Explicit(span)
+                // If we are explicitly closing an auto-close macro we'll emit a diganostic.
+                if explicit && macro_.auto_close {
+                    self.diagnose(Diagnostic::MacroCloseExplicit {
+                        macro_start: macro_.start.clone(),
+                        macro_end: span.clone(),
+                        macro_body: macro_.body.clone(),
+                    })?;
+                }
+
+                // If the hide-stack is non-empty at this point we'll emit an error.
+                if let Some(last_unclosed) = self.hide_stack.last() {
+                    self.diagnose(Diagnostic::MacroCloseHideStack {
+                        macro_start: macro_.start.clone(),
+                        macro_end: span.clone(),
+                        open_hide: last_unclosed.clone(),
+                    })?;
+                }
+
+                // If we are finishing an auto-close macro keep track of this for error messages.
+                self.prev_autoclose_macro = if macro_.auto_close {
+                    Some(macro_.start.start..span.end)
                 } else {
-                    CloseMode::Auto(span)
+                    None
                 };
-                self.close_macro_mode(macro_, close_mode)?;
+
+                // Emit the latex code to close the macro.
+                self.emit_macro_close(macro_)?;
             }
 
             // If there is no macro we could close we'll emit a diagnostic and ignore the command.
@@ -346,88 +458,49 @@ where
         Ok(())
     }
 
-    fn close_macro_mode(&mut self, macro_mode: MacroMode, close_mode: CloseMode) -> Result<()> {
-        // If we are explicitly closing an auto-close macro emit a diganostic and ignore!
-        // Because we ignore here, we don't touch the hide-stack at all.
-        if let CloseMode::Explicit(ref span) = close_mode
-            && macro_mode.auto_close
-        {
-            self.diagnose(Diagnostic::MacroCloseExplicit {
-                macro_start: macro_mode.start.clone(),
-                macro_end: span.clone(),
-            })?;
-            self.mode = Mode::Macro(macro_mode);
-            return Ok(());
-        }
-
-        // If the hide-stack is non-empty at this point emit an error but swallow all the
-        // open hides.
-        if let Some(last_unclosed) = self.hide_stack.last() {
-            match close_mode {
-                CloseMode::Explicit(ref span) | CloseMode::Auto(ref span) => {
-                    let dia = Diagnostic::MacroCloseHideStack {
-                        macro_start: macro_mode.start.clone(),
-                        macro_end: span.clone(),
-                        open_hide: last_unclosed.clone(),
-                    };
-                    self.diagnose(dia)?;
-                }
-                CloseMode::Forced => {
-                    // Swallow all unclosed hides.
-                }
-            }
-            self.hide_stack.clear();
-        }
-
-        // If we are finishing an auto-close macro keep track of this for error messages.
-        self.prev_autoclose_macro = match close_mode {
-            CloseMode::Auto(span) | CloseMode::Explicit(span) if macro_mode.auto_close => {
-                Some(macro_mode.start.start..span.end)
-            }
-            _ => None,
-        };
-
-        // Write the closing LaTeX code. Inline macros get
-        //
-        // ```latex
-        // \end{code}}
-        // ```
-        //
-        // whilst non-inline macros get
-        //
-        // ```latex
-        // \end{code}%
-        // \IfBooleanF{#1}{\end{AgdaSuppressSpace}\end{AgdaAlign}}}"
-        // ```
-        if macro_mode.inline {
-            Ltx::new()
-                .end("code")
-                .push(Group::TEX.close)
-                .ln()
-                .ln()
-                .write(&mut self.output)?;
-        } else {
-            Ltx::new()
-                .end("code")
-                .pctln()
+    /// Writes the closing LaTeX code. If [`macro_mode.inner_mode`][MacroMode::inner_mode] is
+    /// [`Mode::None`] no `\end{code}` will be emitted.
+    ///
+    /// Inline are terminated with
+    ///
+    /// ```latex
+    /// \end{code}}
+    /// ```
+    ///
+    /// Non-inline macros are terminated with
+    ///
+    /// ```latex
+    /// \end{code}%
+    /// \IfBooleanF{#1}{\end{AgdaSuppressSpace}\end{AgdaAlign}}}
+    /// ```
+    fn emit_macro_close(&mut self, macro_mode: MacroMode) -> Result<()> {
+        fn push_macro_suffix(ltx: Ltx<'_, impl Nat>) -> Ltx<'_, impl Nat> {
+            ltx.pctln()
                 .command("IfBooleanF")
                 .group("#1")
                 .with_group(Group::TEX, |ltx| {
                     ltx.end("AgdaSuppressSpace").end("AgdaAlign")
                 })
-                .push(Group::TEX.close)
-                .ln()
-                .ln()
-                .write(&mut self.output)?;
-        };
+        }
+
+        fn push_macro_close(ltx: Ltx<'_, impl Nat>) -> Ltx<'_, impl Nat> {
+            ltx.push(Group::TEX.close).ln().ln()
+        }
+
+        let end_ltx = Ltx::new().end("code");
+        match macro_mode.inner_mode {
+            Mode::None => {
+                push_macro_close(Ltx::new()).write(&mut self.output)?;
+            }
+            Mode::Hide | Mode::Macro(_) if macro_mode.inline => {
+                push_macro_close(end_ltx).write(&mut self.output)?;
+            }
+            Mode::Hide | Mode::Macro(_) => {
+                push_macro_close(push_macro_suffix(end_ltx)).write(&mut self.output)?;
+            }
+        }
         Ok(())
     }
-}
-
-enum CloseMode {
-    Auto(Span),
-    Explicit(Span),
-    Forced,
 }
 
 #[derive(Debug, Clone)]
@@ -437,9 +510,15 @@ pub enum Diagnostic {
         cur_macro_span: Option<Span>,
         new_start_span: Span,
     },
+    UnfinishedMacro {
+        cur_start_span: Span,
+        cur_macro_span: Option<Span>,
+        file_end_span: Span,
+    },
     MacroCloseExplicit {
         macro_start: Span,
         macro_end: Span,
+        macro_body: Option<Span>,
     },
     MacroCloseHideStack {
         macro_start: Span,
@@ -500,11 +579,29 @@ impl Diagnostic {
                     .as_ref()
                     .map(|span| label!(span, "previous macro body").with_priority(-1)),
             ),
+            Diagnostic::UnfinishedMacro {
+                cur_start_span,
+                cur_macro_span,
+                file_end_span,
+            } => build(file_end_span, "unfinished macro")
+                .with_label(label!(cur_start_span, "macro started here"))
+                .with_labels(
+                    cur_macro_span
+                        .as_ref()
+                        .map(|span| label!(span, "macro body").with_priority(-1)),
+                ),
             Diagnostic::MacroCloseExplicit {
                 macro_start,
                 macro_end,
+                macro_body,
             } => build(macro_end, "unexpected macro closure")
-                .with_label(label!(macro_start, "auto-closing macro started here")),
+                .with_label(label!(macro_start, "auto-closing macro started here"))
+                .with_label(label!(macro_end, "closed explicitly here"))
+                .with_labels(
+                    macro_body
+                        .as_ref()
+                        .map(|span| label!(span, "macro body").with_priority(-1)),
+                ),
             Diagnostic::MacroCloseHideStack {
                 macro_start,
                 macro_end,
@@ -569,20 +666,34 @@ impl Diagnostic {
 
 /// While processing a file line by line we have to keep track in which context we are currently
 /// reading the file.
-#[derive(Debug, Default, Clone)]
-enum Mode {
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+enum Mode<M = MacroMode> {
+    /// No open `code` environment.
     #[default]
     None,
+
+    /// Inside a `code` environment with option `[hide]`.
     Hide,
-    Macro(MacroMode),
+
+    /// Inside of a macro definition.
+    ///
+    /// Depending on the context (ie. when stored in [`MacroMode::inner_mode`]) this can also stand
+    /// for inside a `code` environment that is to be typeset.
+    Macro(M),
 }
 
 #[derive(Debug, Default, Clone)]
 struct MacroMode {
+    /// The span of the command that started this macro definition.
     start: Span,
+    /// The `body` span encompasses all the lines since the start of the macro definition.
     body: Option<Span>,
+    /// If this macro is declared to typeset it's code *inline*.
     inline: bool,
+    /// If this macro was indicated to auto-close on the first empty line.
     auto_close: bool,
+    /// Describes the which kind of `code` environment is currently open, if any.
+    inner_mode: Mode<()>,
 }
 
 #[derive(Debug, Clone)]
