@@ -15,7 +15,11 @@ pub struct Macro<'a> {
 }
 
 impl<'a> Macro<'a> {
-    fn push_ltx_comment(self, ltx: Ltx<'a, impl Nat>) -> Ltx<'a, impl Nat> {
+    pub fn to_ltx_comment(self) -> Ltx<'a, impl Nat> {
+        self.push_ltx_comment(Ltx::new())
+    }
+
+    pub fn push_ltx_comment(self, ltx: Ltx<'a, impl Nat>) -> Ltx<'a, impl Nat> {
         ltx.with_comment(move |l| {
             l.command(self.name)
                 .push(if self.inline { "" } else { "[*]" })
@@ -25,7 +29,7 @@ impl<'a> Macro<'a> {
 
 impl std::fmt::Display for Macro<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.push_ltx_comment(Ltx::new()).write_fmt(f)
+        self.to_ltx_comment().write_fmt(f)
     }
 }
 
@@ -58,6 +62,7 @@ impl Translator {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 translation.add_empty_line(line.span().start)?;
+                continue;
             }
 
             match Command::try_parse(trimmed) {
@@ -154,9 +159,9 @@ where
             })
         ) {
             self.close_macro(false, offset..offset + 1)?;
+        } else {
+            writeln!(self.output)?;
         }
-
-        writeln!(self.output)?;
         Ok(())
     }
 
@@ -269,7 +274,7 @@ where
         // arguments.
         let macro_spec = if macro_mode.inline { "" } else { "s" };
         let ltx = macro_
-            .push_ltx_comment(Ltx::new())
+            .to_ltx_comment()
             .command("NewDocumentCommand")
             .command(&name)
             .group(macro_spec)
@@ -632,9 +637,9 @@ impl<'a> Command<'a> {
             (s, false)
         };
 
+        let s = s.trim_start();
         let (name, rest) = s
-            .trim_start()
-            .split_once(|c: char| !c.is_ascii_alphabetic())
+            .split_inclusive_r(|c: char| !c.is_ascii_alphabetic())
             .map(|(name, rest)| (name, rest.trim_start()))
             .unwrap_or((s, SpanStr::with_offset("", s.span().end)));
 

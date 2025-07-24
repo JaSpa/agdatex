@@ -3,10 +3,22 @@ use std::ops::{Bound, Range, RangeBounds};
 pub type Offset = usize;
 pub type Span = Range<Offset>;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SpanStr<'s> {
     str: &'s str,
     offset: Offset,
+}
+
+impl PartialEq<str> for SpanStr<'_> {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<SpanStr<'_>> for str {
+    fn eq(&self, other: &SpanStr<'_>) -> bool {
+        self == other.as_str()
+    }
 }
 
 impl<'s> SpanStr<'s> {
@@ -69,7 +81,7 @@ impl<'s> SpanStr<'s> {
         })
     }
 
-    pub fn split_once(self, predicate: impl FnMut(char) -> bool) -> Option<(Self, Self)> {
+    pub fn split_inclusive_r(self, predicate: impl FnMut(char) -> bool) -> Option<(Self, Self)> {
         self.str.find(predicate).map(|index| {
             // SAFETY: `index` is a valid index because it was returned by `str.find(..)`.
             unsafe { self.split_at_unchecked(index) }
@@ -165,7 +177,7 @@ impl<'s> Iterator for Lines<'s> {
         } else if let Some((ln, rest)) = s.str.split_once('\n') {
             *self = Lines(SpanStr {
                 str: rest,
-                offset: s.offset + ln.len(),
+                offset: s.offset + ln.len() + 1,
             });
             Some(SpanStr {
                 str: ln.strip_suffix('\r').unwrap_or(ln),
@@ -219,5 +231,119 @@ impl DoubleEndedIterator for Lines<'_> {
             str: line,
             offset: offset + prev.len(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lines_empty() {
+        let lines = Vec::from_iter(SpanStr::new("").lines());
+        assert_eq!(lines, vec![] as Vec<SpanStr<'_>>);
+
+        let rev_lines = Vec::from_iter(SpanStr::new("").lines().rev());
+        assert_eq!(rev_lines, vec![] as Vec<SpanStr<'_>>);
+    }
+
+    #[test]
+    fn lines_single_unterminated() {
+        {
+            const LINE: &str = "Hello, World!";
+            let str = SpanStr::new(LINE);
+
+            let lines = Vec::from_iter(str.lines());
+            assert_eq!(lines, vec![SpanStr::with_offset(LINE, 0)]);
+
+            let rev_lines = Vec::from_iter(str.lines().rev());
+            assert_eq!(rev_lines, vec![SpanStr::with_offset(LINE, 0)]);
+        }
+
+        {
+            const LINE: &str = "Hello, World!\r";
+            let str = SpanStr::new(LINE);
+
+            let lines = Vec::from_iter(str.lines());
+            assert_eq!(lines, vec![SpanStr::with_offset(LINE, 0)]);
+
+            let rev_lines = Vec::from_iter(str.lines().rev());
+            assert_eq!(rev_lines, vec![SpanStr::with_offset(LINE, 0)]);
+        }
+    }
+
+    #[test]
+    fn lines_single_terminated() {
+        const LINE: &str = "Hello, World!";
+
+        {
+            let str = format!("{LINE}\n");
+            let str = SpanStr::new(&str);
+
+            let lines = Vec::from_iter(str.lines());
+            assert_eq!(lines, vec![SpanStr::with_offset(LINE, 0)]);
+
+            let rev_lines = Vec::from_iter(str.lines().rev());
+            assert_eq!(rev_lines, vec![SpanStr::with_offset(LINE, 0)]);
+        }
+
+        {
+            let str = format!("{LINE}\r\n");
+            let str = SpanStr::new(&str);
+
+            let lines = Vec::from_iter(str.lines());
+            assert_eq!(lines, vec![SpanStr::with_offset(LINE, 0)]);
+
+            let rev_lines = Vec::from_iter(str.lines().rev());
+            assert_eq!(rev_lines, vec![SpanStr::with_offset(LINE, 0)]);
+        }
+    }
+
+    #[test]
+    fn lines_multiline() {
+        #[rustfmt::skip]
+        let lines = [
+            "01234567",
+            "abcdefgh",
+            "ABCDEFGH",
+            "jklmnopq",
+            "JKLMNOPQ"
+        ];
+
+        let lines_spanned = lines
+            .iter()
+            .enumerate()
+            .map(|(i, ln)| SpanStr::with_offset(ln, i * 10))
+            .collect::<Vec<_>>();
+        let lines_spanned_rev = lines_spanned.iter().rev().copied().collect::<Vec<_>>();
+
+        let str = lines.join("\r\n");
+        assert_eq!(Vec::from_iter(SpanStr::new(&str).lines()), lines_spanned);
+        assert_eq!(
+            Vec::from_iter(SpanStr::new(&str).lines().rev()),
+            lines_spanned_rev
+        );
+
+        let mut iter = SpanStr::new(&str).lines();
+        assert_eq!(iter.next(), Some(lines_spanned[0]));
+        assert_eq!(iter.next_back(), Some(lines_spanned_rev[0]));
+        assert_eq!(iter.next(), Some(lines_spanned[1]));
+        assert_eq!(iter.next_back(), Some(lines_spanned_rev[1]));
+        assert_eq!(iter.next(), Some(lines_spanned[2]));
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next_back(), None);
+    }
+
+    #[test]
+    fn split_inclusive_r() {
+        let str = SpanStr::new("hello=bye");
+        assert_eq!(str.split_inclusive_r(|c| c == ' '), None);
+        assert_eq!(
+            str.split_inclusive_r(|c| c == '='),
+            Some((
+                SpanStr::with_offset("hello", 0),
+                SpanStr::with_offset("=bye", 5)
+            ))
+        );
     }
 }

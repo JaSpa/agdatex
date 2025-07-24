@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
     fs::{File, OpenOptions},
-    io::{Read, Write},
+    io::Read,
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
     process::{Command, ExitStatus},
@@ -365,7 +365,7 @@ struct Agdatex {
 #[derive(Default)]
 struct State {
     source_buffer: String,
-    translated_paths: Vec<PathBuf>,
+    translated_item_paths: Vec<PathBuf>,
     translator: Translator,
     diagnostics_count: u32,
     cur_assemble_file: Option<File>,
@@ -384,6 +384,20 @@ impl FileAction {
             FileAction::Copy => "COPY",
         }
     }
+
+    fn adjust_target_file_name(self, source: Cow<'_, Path>) -> Cow<'_, Path> {
+        match self {
+            FileAction::Copy => source,
+            FileAction::Translate => {
+                Cow::Owned(adjusted_translation_target_file_name(source.into_owned()))
+            }
+        }
+    }
+}
+
+fn adjusted_translation_target_file_name(mut path: PathBuf) -> PathBuf {
+    path.set_extension("lagda.tex");
+    path
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -483,10 +497,10 @@ impl Item<'_> {
         })
     }
 
-    fn open_target_file(&self, base: impl AsRef<Path>) -> Result<File> {
+    fn open_translation_target_file(&self, base: impl AsRef<Path>) -> Result<File> {
         Ok(match self {
             Item::UserInput { path } => {
-                let target_path = base.as_ref().join(path);
+                let target_path = adjusted_translation_target_file_name(base.as_ref().join(path));
                 OpenOptions::new()
                     .write(true)
                     .create(true)
@@ -497,11 +511,14 @@ impl Item<'_> {
                 name,
                 parent_fd_target,
                 ..
-            } => OpenOptionsAt::default()
-                .write(fs_at::OpenOptionsWriteMode::Write)
-                .create(true)
-                .truncate(true)
-                .open_at(parent_fd_target, name)?,
+            } => {
+                let target_name = adjusted_translation_target_file_name(name.into());
+                OpenOptionsAt::default()
+                    .write(fs_at::OpenOptionsWriteMode::Write)
+                    .create(true)
+                    .truncate(true)
+                    .open_at(parent_fd_target, target_name)?
+            }
         })
     }
 
@@ -532,23 +549,6 @@ impl Item<'_> {
 }
 
 impl Agdatex {
-    fn target_path_translated(&self, item_path: impl AsRef<Path>) -> PathBuf {
-        let mut pb = self.temp_dir.join(item_path);
-        pb.set_extension("lagda.tex");
-        pb
-    }
-
-    fn target_path_copied(&self, item_path: impl AsRef<Path>) -> PathBuf {
-        self.temp_dir.join(item_path)
-    }
-
-    fn action_target_path(&self, item_path: impl AsRef<Path>, action: FileAction) -> PathBuf {
-        match action {
-            FileAction::Translate => self.target_path_translated(item_path),
-            FileAction::Copy => self.target_path_copied(item_path),
-        }
-    }
-
     fn run(mut self, cache: &mut Cache, sources: Vec<PathBuf>) -> Result<()> {
         // Ensure the output directory exists.
         std::fs::create_dir_all(&self.output_dir)?;
@@ -564,7 +564,8 @@ impl Agdatex {
         latex_dir_arg.push(std::path::absolute(&self.output_dir)?);
 
         // Compile all the translated files to LaTeX.
-        for translated in self.state.translated_paths {
+        for translated in self.state.translated_item_paths {
+            verb!(self.verb, "COMPL {}", translated.display());
             Command::new("agda")
                 .current_dir(&self.temp_dir)
                 .arg("--only-scope-checking")
@@ -592,6 +593,12 @@ impl Agdatex {
     }
 
     fn translate_dir(&mut self, parent_item: Item, fd: File) -> Result<()> {
+        let mut item_path_display = String::new();
+        self.verb.if_enabled(|| {
+            item_path_display = parent_item.to_path_buf().display().to_string();
+        });
+        verb!(self.verb, "ENTER {item_path_display}");
+
         // Create the corresponding directory in the target directory.
         let target_dir_fd = parent_item.create_target_dir(&self.temp_dir)?;
 
@@ -630,6 +637,7 @@ impl Agdatex {
             })?;
         }
 
+        verb!(self.verb, "LEAVE {item_path_display}");
         Ok(())
     }
 
@@ -641,13 +649,14 @@ impl Agdatex {
         };
 
         let item_path = item.to_path_buf();
-        let target_path = self.action_target_path(&item_path, action);
+        let item_target_path = action.adjust_target_file_name((&item_path).into());
+        let full_target_path = self.temp_dir.join(&item_target_path);
         verb!(
             self.verb,
             "{} {} ({})",
             action.description(),
             item_path.display(),
-            target_path.display()
+            full_target_path.display()
         );
 
         match action {
@@ -658,12 +667,14 @@ impl Agdatex {
                 file.read_to_string(&mut self.state.source_buffer)?;
 
                 // Open target file.
-                let out_file = item.open_target_file(&self.temp_dir)?;
+                let out_file = item.open_translation_target_file(&self.temp_dir)?;
 
                 // Translate source.
                 let needs_compile = self.translate_src(&item_path, out_file)?;
                 if needs_compile {
-                    self.state.translated_paths.push(target_path);
+                    self.state
+                        .translated_item_paths
+                        .push(item_target_path.into_owned());
                 }
             }
 
@@ -681,7 +692,7 @@ impl Agdatex {
             //
             // For now, we ignore FD-relativity and use `std::fs::copy.
             FileAction::Copy => {
-                std::fs::copy(item_path, target_path)?;
+                std::fs::copy(&item_path, &*full_target_path)?;
             }
         }
 
@@ -705,8 +716,8 @@ impl Agdatex {
             },
             |macro_| {
                 has_macro = true;
-                if let Some(ref mut file) = self.state.cur_assemble_file {
-                    write!(file, "{macro_}")?;
+                if let Some(ref file) = self.state.cur_assemble_file {
+                    macro_.to_ltx_comment().write(file)?;
                 }
                 Ok(())
             },
@@ -752,7 +763,7 @@ impl<'a, N: Fn() -> String> ariadne::Cache<()> for NamedSource<'a, N> {
     }
 }
 
-pub trait CommandSuccess {
+trait CommandSuccess {
     fn expect_success<R>(
         &self,
         result: std::io::Result<R>,
@@ -761,7 +772,6 @@ pub trait CommandSuccess {
     ) -> Result<R>;
 
     fn expect_run(&mut self) -> Result<()>;
-    fn success_output(&mut self) -> Result<std::process::Output>;
 }
 
 impl CommandSuccess for Command {
@@ -794,26 +804,6 @@ impl CommandSuccess for Command {
         let result = self.spawn().and_then(|mut child| child.wait());
         self.expect_success(result, |exit| *exit, |report, _| report)?;
         Ok(())
-    }
-
-    fn success_output(&mut self) -> Result<std::process::Output> {
-        let with_out_section = |report: color_eyre::Report, header: &'static str, out: &[u8]| {
-            if out.is_empty() {
-                report
-            } else {
-                report.section(String::from_utf8_lossy(out).into_owned().header(header))
-            }
-        };
-        let result = self.output();
-        self.expect_success(
-            result,
-            |out| out.status,
-            |mut report, out| {
-                report = with_out_section(report, "Stdout", &out.stdout);
-                report = with_out_section(report, "Stderr", &out.stderr);
-                report
-            },
-        )
     }
 }
 
