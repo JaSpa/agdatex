@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     cell::LazyCell,
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     ffi::{OsStr, OsString},
     fs::{File, OpenOptions},
     io::{Read, Write},
@@ -17,6 +17,7 @@ use color_eyre::{
     eyre::{Context, eyre},
 };
 use fs_at::OpenOptions as OpenOptionsAt;
+use hash_writer::HashWriter;
 use ltx_write::Ltx;
 use merde::MerdeError;
 use sha2::{
@@ -26,6 +27,7 @@ use sha2::{
 use tempdir::TempDir;
 use translation::Translator;
 
+mod hash_writer;
 mod ltx_write;
 mod span_str;
 mod string_stack;
@@ -76,6 +78,10 @@ struct Args {
     /// Clear caches to force a rebuild of all modules.
     #[arg(short, long)]
     clear: bool,
+
+    /// Enable fast Agda to LaTeX compilation; passes the `--only-scope-checking` flag to Agda.
+    #[arg(long, alias = "only-scope-checking")]
+    fast: bool,
 
     /// Paths to annotated .agda files.
     sources: Vec<PathBuf>,
@@ -254,6 +260,7 @@ fn main() -> Result<ExitCode> {
     let mut tmp_dir: Option<TempDir> = None;
     let resolved_args = Agdatex {
         verb,
+        fast_compile: args.fast,
         output_dir: args.output_dir,
         temp_dir: if let Some(tmp) = args.temp_dir {
             tmp
@@ -279,8 +286,19 @@ fn main() -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Hash)]
 struct CachePath<P>(P);
+
+impl<P1, P2> PartialEq<CachePath<P1>> for CachePath<P2>
+where
+    P2: PartialEq<P1>,
+{
+    fn eq(&self, other: &CachePath<P1>) -> bool {
+        self.0.eq(&other.0)
+    }
+}
+
+impl<P> Eq for CachePath<P> where P: Eq {}
 
 impl<P: std::fmt::Display> std::fmt::Display for CachePath<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -384,6 +402,22 @@ struct CacheEntry {
     fully_typechecked: bool,
 }
 
+impl CacheEntry {
+    /// Updates the `CacheEntry` and returns `true` if a recompilation is necessary.
+    fn update(&mut self, digest: Sha256Digest, full_typechecking: bool) -> bool {
+        if self.digest != digest {
+            self.digest = digest;
+            self.fully_typechecked = full_typechecking;
+            true
+        } else if self.fully_typechecked || !full_typechecking {
+            false
+        } else {
+            self.fully_typechecked = full_typechecking;
+            true
+        }
+    }
+}
+
 merde::derive! {
     impl (Serialize, Deserialize) for struct CacheEntry {
         digest,
@@ -398,12 +432,13 @@ struct Agdatex {
     temp_dir: PathBuf,
     verb: VerbOutput,
     state: State,
+    fast_compile: bool,
 }
 
 #[derive(Default)]
 struct State {
     source_buffer: String,
-    translated_item_paths: Vec<PathBuf>,
+    translated_item_paths: Vec<(PathBuf, Sha256Digest)>,
     translator: Translator,
     diagnostics_count: u32,
     cur_assemble_file: Option<File>,
@@ -602,14 +637,32 @@ impl Agdatex {
         latex_dir_arg.push(std::path::absolute(&self.output_dir)?);
 
         // Compile all the translated files to LaTeX.
-        for translated in self.state.translated_item_paths {
+        for (translated, trans_hash) in self.state.translated_item_paths {
+            let compile = match cache.entry(CachePath(translated.clone().into())) {
+                Entry::Occupied(mut entry) => {
+                    entry.get_mut().update(trans_hash, !self.fast_compile)
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(CacheEntry {
+                        digest: trans_hash,
+                        fully_typechecked: !self.fast_compile,
+                    });
+                    true
+                }
+            };
+
+            if !compile {
+                verb!(self.verb, "CACHE {}", translated.display());
+                continue;
+            }
+
             verb!(self.verb, "COMPL {}", translated.display());
             Command::new("agda")
                 .current_dir(&self.temp_dir)
-                .arg("--only-scope-checking")
+                .args(self.fast_compile.then_some("--only-scope-checking"))
                 .arg("--latex")
                 .arg(&latex_dir_arg)
-                .arg(translated)
+                .arg(&translated)
                 .expect_run()?;
         }
 
@@ -708,11 +761,10 @@ impl Agdatex {
                 let out_file = item.open_translation_target_file(&self.temp_dir)?;
 
                 // Translate source.
-                let needs_compile = self.translate_src(&item_path, out_file)?;
-                if needs_compile {
+                if let Some(translation_hash) = self.translate_src(&item_path, out_file)? {
                     self.state
                         .translated_item_paths
-                        .push(item_target_path.into_owned());
+                        .push((item_target_path.into_owned(), translation_hash));
                 }
             }
 
@@ -737,14 +789,17 @@ impl Agdatex {
         Ok(())
     }
 
-    fn translate_src(&mut self, item_path: &Path, out_file: File) -> Result<bool> {
+    fn translate_src(&mut self, item_path: &Path, out_file: File) -> Result<Option<Sha256Digest>> {
         let pp_path = LazyCell::new(|| item_path.display().to_string());
         let mut has_macro = false;
+
+        // Prepare the hash collector.
+        let mut output: HashWriter<Sha256, _> = out_file.into();
 
         // Run the translator.
         self.state.translator.run(
             &self.state.source_buffer,
-            out_file,
+            &mut output,
             |diag| {
                 self.state.diagnostics_count += 1;
                 diag.to_report().print(NamedSource {
@@ -771,7 +826,7 @@ impl Agdatex {
         }
 
         // The file has to be compiled to LaTeX if it contained any macros.
-        Ok(has_macro)
+        Ok(has_macro.then(|| Sha256Digest(output.finalize().0)))
     }
 }
 

@@ -210,7 +210,7 @@ where
         }
 
         self.ensure_correct_macro_mode()?;
-        writeln!(self.output, "{line}")?;
+        Ltx::new().push(line).ln().write(&mut self.output)?;
 
         Ok(())
     }
