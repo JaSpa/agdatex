@@ -357,9 +357,7 @@ where
         } else {
             ltx.command("IfBooleanF")
                 .group("#1")
-                .with_group(Group::TEX, |ltx| {
-                    ltx.begin_("AgdaSuppressSpace").begin_("AgdaAlign")
-                })
+                .with_group(Group::TEX, |ltx| ltx.begin_("AgdaMultiCode"))
                 .pctln()
                 .write(&mut self.output)?;
         }
@@ -478,9 +476,7 @@ where
             ltx.pctln()
                 .command("IfBooleanF")
                 .group("#1")
-                .with_group(Group::TEX, |ltx| {
-                    ltx.end("AgdaSuppressSpace").end("AgdaAlign")
-                })
+                .with_group(Group::TEX, |ltx| ltx.end("AgdaMultiCode"))
         }
 
         fn push_macro_close(ltx: Ltx<'_, impl Nat>) -> Ltx<'_, impl Nat> {
