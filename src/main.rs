@@ -16,7 +16,7 @@ use color_eyre::{
 };
 use fs_at::OpenOptions as OpenOptionsAt;
 use ltx_write::Ltx;
-use nix::errno::Errno;
+use nix::{NixPath, errno::Errno};
 use sha2::{
     Digest, Sha256,
     digest::{OutputSizeUser, generic_array::GenericArray},
@@ -154,7 +154,7 @@ fn main() -> Result<ExitCode> {
         fast_compile: args.fast,
         ignore_cache: args.clear,
         output_dir: args.output_dir,
-        temp_dir: if let Some(tmp) = args.temp_dir {
+        trans_dir: if let Some(tmp) = args.temp_dir {
             tmp
         } else {
             let tmp = TempDir::new("agdatex")?;
@@ -168,7 +168,7 @@ fn main() -> Result<ExitCode> {
     verb!(
         verb,
         "Temporary directory: {}",
-        resolved_args.temp_dir.display()
+        resolved_args.trans_dir.display()
     );
 
     resolved_args.run(sources)?;
@@ -348,7 +348,7 @@ impl std::fmt::Display for SourceHash {
 
 struct Agdatex {
     output_dir: PathBuf,
-    temp_dir: PathBuf,
+    trans_dir: PathBuf,
     verb: VerbOutput,
     state: State,
     fast_compile: bool,
@@ -365,7 +365,7 @@ struct State {
     cur_assemble_file: Option<File>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileAction {
     Translate,
     Copy,
@@ -378,21 +378,15 @@ impl FileAction {
             FileAction::Copy => "COPY",
         }
     }
-
-    fn adjust_target_file_name(self, source: &Path) -> Cow<'_, Path> {
-        match self {
-            FileAction::Copy => source.into(),
-            FileAction::Translate => {
-                let mut p = source.to_owned();
-                p.set_extension(EXT_TRANSLATED);
-                p.into()
-            }
-        }
-    }
 }
 
-const EXT_COMPILED: &str = "tex";
 const EXT_TRANSLATED: &str = "lagda.tex";
+
+struct ItemPaths {
+    source_path: PathBuf,
+    /// The quasi-absolute path to the translated item.
+    translated_path: PathBuf,
+}
 
 #[derive(Debug, Clone, Copy)]
 enum Item<'a> {
@@ -498,7 +492,7 @@ impl Item<'_> {
 
     fn open_translation_target_file(&self, base: impl AsRef<Path>) -> Result<File> {
         let adjust_ext = |mut p: PathBuf| {
-            p.set_extension(EXT_COMPILED);
+            p.set_extension(EXT_TRANSLATED);
             p
         };
         Ok(match self {
@@ -531,9 +525,9 @@ impl Item<'_> {
         fn push_with_cap(item: &Item, path_buf: &mut PathBuf, additional_cap: usize) {
             match item {
                 Item::UserInput { path } => {
-                    let additional_cap = additional_cap + 1 + path.as_os_str().len();
+                    let additional_cap = additional_cap + path.as_os_str().len();
                     path_buf.reserve(additional_cap);
-                    path_buf.push(path)
+                    path_buf.push(path);
                 }
                 Item::ChildItem {
                     name, parent_item, ..
@@ -545,13 +539,40 @@ impl Item<'_> {
             }
         }
 
-        push_with_cap(self, path_buf, 0);
+        push_with_cap(self, path_buf, 0)
     }
 
     fn to_path_buf(self) -> PathBuf {
         let mut buf = PathBuf::new();
         self.push_path(&mut buf);
         buf
+    }
+
+    fn assemble_item_paths(&self, action: FileAction, trans_base: impl AsRef<Path>) -> ItemPaths {
+        let source_path = self.to_path_buf();
+        let source_ext_len = source_path.extension().map(OsStr::len).unwrap_or_default();
+
+        let mk_path = |base: &Path, ext: Option<&str>| {
+            let mut cap = base.len() + 1 + source_path.len();
+            if let Some(ext) = ext {
+                cap += ext.len().saturating_sub(source_ext_len);
+            }
+
+            let mut p = PathBuf::with_capacity(cap);
+            p.push(base);
+            p.push(&source_path);
+            if let Some(ext) = ext {
+                p.set_extension(ext);
+            }
+            p
+        };
+
+        let do_translate = action == FileAction::Translate;
+        let translated_path = mk_path(trans_base.as_ref(), do_translate.then_some(EXT_TRANSLATED));
+        ItemPaths {
+            source_path,
+            translated_path,
+        }
     }
 }
 
@@ -574,7 +595,7 @@ impl Agdatex {
         for translated in self.state.translated_item_paths {
             verb!(self.verb, "COMPL {}", translated.display());
             Command::new("agda")
-                .current_dir(&self.temp_dir)
+                .current_dir(&self.trans_dir)
                 .args(self.fast_compile.then_some("--only-scope-checking"))
                 .arg("--latex")
                 .arg(&latex_dir_arg)
@@ -585,59 +606,43 @@ impl Agdatex {
         Ok(())
     }
 
-    fn read_compiled_source_hash(&self, item: &Item) -> Result<SourceHash, SourceHashReadError> {
-        // Assemble the path where the item will be placed.
-        let mut target_path = self.output_dir.clone();
-        item.push_path(&mut target_path);
-        target_path.with_extension(EXT_COMPILED);
-
-        // Extract the source hash from the previously compiled file.
-        SourceHash::try_read(File::open(target_path)?)
-    }
-
-    fn maybe_push_translated_path(
-        &mut self,
-        item: &Item,
-        source_hash: &SourceHash,
-        translated: PathBuf,
-    ) {
-        // If we don't unconditionally ignore the cache check if there are reasons to avoid
-        // compilation.
-        if !self.ignore_cache {
-            match self.read_compiled_source_hash(item) {
-                Ok(compiled_hash) if *source_hash == compiled_hash => {
-                    verb!(
-                        self.verb,
-                        "CACHE HIT {} ({source_hash})",
-                        translated.display()
-                    );
-                    return;
-                }
-                Ok(compiled_hash) => {
-                    verb!(
-                        self.verb,
-                        "CACHE MISMATCH {}\n  old: {compiled_hash}\n  new: {source_hash}",
-                        translated.display()
-                    );
-                }
-                Err(error) => {
-                    verb!(
-                        self.verb,
-                        "CACHE MISMATCH {} ({error:#?})",
-                        translated.display()
-                    );
-                }
-            };
+    fn maybe_push_translated_path(&mut self, item_paths: ItemPaths, source_hash: &SourceHash) {
+        let compiled_hash = if self.ignore_cache {
+            None
         } else {
-            verb!(
-                self.verb,
-                "CACHE MISMATCH {} (cleared)",
-                translated.display()
-            );
+            let mut target_path = self.output_dir.join(&item_paths.source_path);
+            target_path.set_extension("tex");
+            Some(
+                File::open(target_path)
+                    .map_err(<_>::into)
+                    .and_then(SourceHash::try_read),
+            )
+        };
+
+        let trans_display = item_paths.translated_path.display();
+        match compiled_hash {
+            None => {
+                verb!(self.verb, "CACHE MISMATCH {trans_display} (cache cleared)");
+            }
+            Some(Ok(compiled_hash)) if *source_hash == compiled_hash => {
+                verb!(self.verb, "CACHE HIT {trans_display} ({source_hash})");
+                return;
+            }
+            Some(Ok(compiled_hash)) => {
+                verb!(
+                    self.verb,
+                    "CACHE MISMATCH {trans_display}\n  old: {compiled_hash}\n  new: {source_hash}"
+                );
+            }
+            Some(Err(error)) => {
+                verb!(self.verb, "CACHE MISMATCH {trans_display} ({error:#?})");
+            }
         }
 
         // At this point we are sure to compile this item!
-        self.state.translated_item_paths.push(translated);
+        self.state
+            .translated_item_paths
+            .push(item_paths.source_path.with_extension(EXT_TRANSLATED));
     }
 
     fn translate_item(&mut self, item: Item) -> Result<()> {
@@ -662,7 +667,7 @@ impl Agdatex {
         verb!(self.verb, "ENTER {item_path_display}");
 
         // Create the corresponding directory in the target directory.
-        let target_dir_fd = parent_item.create_target_dir(&self.temp_dir)?;
+        let target_dir_fd = parent_item.create_target_dir(&self.trans_dir)?;
 
         // If we are translating a directory we have to create an assembly file if there is not
         // one already.
@@ -710,15 +715,13 @@ impl Agdatex {
             return Ok(());
         };
 
-        let item_path = item.to_path_buf();
-        let item_target_path = action.adjust_target_file_name(&item_path);
-        let full_target_path = self.temp_dir.join(&item_target_path);
+        let item_paths = item.assemble_item_paths(action, &self.trans_dir);
         verb!(
             self.verb,
             "{} {} ({})",
             action.description(),
-            item_path.display(),
-            full_target_path.display()
+            item_paths.source_path.display(),
+            item_paths.translated_path.display()
         );
 
         match action {
@@ -729,19 +732,15 @@ impl Agdatex {
                 file.read_to_string(&mut self.state.source_buffer)?;
 
                 // Open target file.
-                let out_file = item.open_translation_target_file(&self.temp_dir)?;
+                let out_file = item.open_translation_target_file(&self.trans_dir)?;
                 // Write the source hash for future comparison.
                 let source_hash = SourceHash::new(&self.state.source_buffer);
                 source_hash.write(&out_file)?;
 
-                // Translate source.
-                //
-                // There is nothing to gain with trying to avoid the `into_owned` call here: at
-                // this point we know that the `Cow` must wrap an allocated value.
-                let item_target_path = item_target_path.into_owned();
-                let should_compile = self.translate_src(item_path, out_file)?;
+                // Translate source. Conditionally remember for Literate Agda -> LaTeX compilation.
+                let should_compile = self.translate_src(&item_paths, out_file)?;
                 if should_compile {
-                    self.maybe_push_translated_path(&item, &source_hash, item_target_path);
+                    self.maybe_push_translated_path(item_paths, &source_hash);
                 }
             }
 
@@ -759,7 +758,7 @@ impl Agdatex {
             //
             // For now, we ignore FD-relativity and use `std::fs::copy.
             FileAction::Copy => {
-                std::fs::copy(&item_path, &*full_target_path)?;
+                std::fs::copy(item_paths.source_path, item_paths.translated_path)?;
             }
         }
 
@@ -779,8 +778,8 @@ impl Agdatex {
     ///
     /// This function will return an error if any I/O errors are encoutered while writing to
     /// `out_file` or when printing diagnostics.
-    fn translate_src(&mut self, item_path: PathBuf, out_file: File) -> Result<bool> {
-        let pp_path = LazyCell::new(|| item_path.display().to_string());
+    fn translate_src(&mut self, item_paths: &ItemPaths, out_file: File) -> Result<bool> {
+        let pp_path = LazyCell::new(|| item_paths.source_path.display().to_string());
         let mut has_macro = false;
 
         // Run the translator.
@@ -804,11 +803,11 @@ impl Agdatex {
         )?;
 
         if has_macro && let Some(ref file) = self.state.cur_assemble_file {
-            let mut tex_path = item_path;
-            tex_path.set_extension(EXT_COMPILED);
+            let input_path = item_paths.source_path.with_extension("");
+            let input_path_str = input_path.as_os_str().to_string_lossy();
             Ltx::new()
                 .command("input")
-                .group(&tex_path.as_os_str().to_string_lossy())
+                .group(&input_path_str)
                 .ln()
                 .ln()
                 .write(file)?;
