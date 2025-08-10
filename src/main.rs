@@ -152,6 +152,7 @@ fn main() -> Result<ExitCode> {
     let resolved_args = Agdatex {
         verb,
         fast_compile: args.fast,
+        ignore_cache: args.clear,
         output_dir: args.output_dir,
         temp_dir: if let Some(tmp) = args.temp_dir {
             tmp
@@ -351,6 +352,7 @@ struct Agdatex {
     verb: VerbOutput,
     state: State,
     fast_compile: bool,
+    ignore_cache: bool,
 }
 
 #[derive(Default)]
@@ -599,30 +601,40 @@ impl Agdatex {
         source_hash: &SourceHash,
         translated: PathBuf,
     ) {
-        match self.read_compiled_source_hash(item) {
-            Ok(compiled_hash) if *source_hash == compiled_hash => {
-                verb!(
-                    self.verb,
-                    "CACHE HIT {} ({source_hash})",
-                    translated.display()
-                );
-                return;
-            }
-            Ok(compiled_hash) => {
-                verb!(
-                    self.verb,
-                    "CACHE MISMATCH {}\n  old: {compiled_hash}\n  new: {source_hash}",
-                    translated.display()
-                );
-            }
-            Err(error) => {
-                verb!(
-                    self.verb,
-                    "CACHE MISMATCH {} ({error:#?})",
-                    translated.display()
-                );
-            }
-        };
+        // If we don't unconditionally ignore the cache check if there are reasons to avoid
+        // compilation.
+        if !self.ignore_cache {
+            match self.read_compiled_source_hash(item) {
+                Ok(compiled_hash) if *source_hash == compiled_hash => {
+                    verb!(
+                        self.verb,
+                        "CACHE HIT {} ({source_hash})",
+                        translated.display()
+                    );
+                    return;
+                }
+                Ok(compiled_hash) => {
+                    verb!(
+                        self.verb,
+                        "CACHE MISMATCH {}\n  old: {compiled_hash}\n  new: {source_hash}",
+                        translated.display()
+                    );
+                }
+                Err(error) => {
+                    verb!(
+                        self.verb,
+                        "CACHE MISMATCH {} ({error:#?})",
+                        translated.display()
+                    );
+                }
+            };
+        } else {
+            verb!(
+                self.verb,
+                "CACHE MISMATCH {} (cleared)",
+                translated.display()
+            );
+        }
 
         // At this point we are sure to compile this item!
         self.state.translated_item_paths.push(translated);
