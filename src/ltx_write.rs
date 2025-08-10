@@ -4,6 +4,8 @@ use std::{
     marker::PhantomData,
 };
 
+use crate::write_all_vectored;
+
 #[repr(C)]
 #[derive(Clone)]
 pub struct SliceArray<'s, Init> {
@@ -162,7 +164,7 @@ impl<'s, N: Nat> Ltx<'s, N> {
 
     pub fn write(mut self, writer: impl io::Write) -> io::Result<()> {
         let bufs = N::mk_bufs_mut(&mut self.slices);
-        write_vectored_all(writer, bufs)
+        write_all_vectored(writer, bufs)
     }
 
     fn iter(&self) -> impl Iterator<Item = &str> {
@@ -195,25 +197,6 @@ impl<N: Nat> fmt::Display for Ltx<'_, N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.clone().write_fmt(f)
     }
-}
-
-fn write_vectored_all(mut writer: impl io::Write, mut bufs: &mut [IoSlice<'_>]) -> io::Result<()> {
-    // The initial `advance_slices` call skips over any empty slices at the start of `bufs`.
-    IoSlice::advance_slices(&mut bufs, 0);
-    while !bufs.is_empty() {
-        match writer.write_vectored(bufs) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "failed to write whole buffer",
-                ));
-            }
-            Ok(n) => IoSlice::advance_slices(&mut bufs, n),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

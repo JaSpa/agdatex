@@ -1,11 +1,9 @@
 use std::{
     borrow::Cow,
     cell::LazyCell,
-    collections::{HashMap, hash_map::Entry},
     ffi::{OsStr, OsString},
     fs::{File, OpenOptions},
-    io::{Read, Write},
-    os::unix::ffi::{OsStrExt, OsStringExt},
+    io::{ErrorKind, IoSlice, Read, Write},
     path::{Path, PathBuf},
     process::{Command, ExitCode, ExitStatus},
 };
@@ -17,17 +15,15 @@ use color_eyre::{
     eyre::{Context, eyre},
 };
 use fs_at::OpenOptions as OpenOptionsAt;
-use hash_writer::HashWriter;
 use ltx_write::Ltx;
-use merde::MerdeError;
+use nix::errno::Errno;
 use sha2::{
-    Sha256,
+    Digest, Sha256,
     digest::{OutputSizeUser, generic_array::GenericArray},
 };
 use tempdir::TempDir;
 use translation::Translator;
 
-mod hash_writer;
 mod ltx_write;
 mod span_str;
 mod string_stack;
@@ -42,14 +38,6 @@ impl VerbOutput {
     fn if_enabled(self, f: impl FnOnce()) {
         if self.enabled {
             f()
-        }
-    }
-
-    fn write_err(self, error: color_eyre::Report) {
-        if self.enabled {
-            eprintln!("{error:?}")
-        } else {
-            eprintln!("{error}")
         }
     }
 }
@@ -99,103 +87,6 @@ fn normalize_source(path: impl AsRef<Path>, root: impl AsRef<Path>) -> Result<Pa
         )
     })?;
     Ok(rel_path.to_path_buf())
-}
-
-fn with_cache<R: 'static>(
-    from_disk_flag: bool,
-    verb: VerbOutput,
-    f: impl for<'a> FnOnce(&mut Cache<'a>) -> Result<R>,
-) -> Result<R> {
-    const CACHE_PATH: &str = ".agdatex-hashes.json";
-
-    enum FromDisk<S> {
-        CleanCache,
-        LoadCache(S),
-        Failure(color_eyre::Report),
-    }
-
-    impl<S> FromDisk<S> {
-        fn try_next<R, E: Into<color_eyre::Report>>(
-            self,
-            f: impl FnOnce(S) -> Result<Option<R>, E>,
-        ) -> FromDisk<R> {
-            match self {
-                FromDisk::CleanCache => FromDisk::CleanCache,
-                FromDisk::Failure(report) => FromDisk::Failure(report),
-                FromDisk::LoadCache(s) => match f(s) {
-                    Ok(None) => FromDisk::CleanCache,
-                    Ok(Some(r)) => FromDisk::LoadCache(r),
-                    Err(e) => FromDisk::Failure(e.into()),
-                },
-            }
-        }
-    }
-
-    let mut cache_json = String::new();
-
-    let from_disk = if from_disk_flag {
-        FromDisk::LoadCache(())
-    } else {
-        FromDisk::CleanCache
-    };
-
-    let from_disk = from_disk
-        .try_next(|_| {
-            let open_res = File::open(CACHE_PATH);
-            if open_res
-                .as_ref()
-                .is_err_and(|e| matches!(e.kind(), std::io::ErrorKind::NotFound))
-            {
-                Ok(None)
-            } else {
-                open_res.map(Some)
-            }
-        })
-        .try_next(|mut f| {
-            f.read_to_string(&mut cache_json)
-                .wrap_err("parsing cache data failed")
-                .map(Some)
-        })
-        .try_next(|_| {
-            merde_json::from_str::<Cache>(&cache_json)
-                .map_err(|err| eyre!("{err}").wrap_err("parsing cache data failed"))
-                .map(Some)
-        });
-
-    let mut cache = match from_disk {
-        FromDisk::CleanCache => {
-            if from_disk_flag {
-                verb!(verb, "cache: {CACHE_PATH} does not exist");
-            } else {
-                verb!(verb, "cache: ignoring any cached state");
-            }
-            Cache::default()
-        }
-        FromDisk::LoadCache(c) => c,
-        FromDisk::Failure(report) => {
-            verb.write_err(report.wrap_err(format!("cache: loading {CACHE_PATH} failed")));
-            Cache::default()
-        }
-    };
-
-    let result = f(&mut cache)?;
-
-    // If the main operation succeeded, try to write the cache back to the file system.
-    let writeback = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(CACHE_PATH)
-        .map_err(color_eyre::Report::from)
-        .and_then(|mut file| {
-            merde_json::to_writer(&mut file, &cache).map_err(color_eyre::Report::from)
-        });
-    if let Err(err) = writeback {
-        verb.write_err(err.wrap_err("cache: serializing at {CACHE_PATH} failed"));
-    }
-
-    // Return the result.
-    Ok(result)
 }
 
 fn translate_stdin(_args: Args) -> Result<ExitCode> {
@@ -279,153 +170,180 @@ fn main() -> Result<ExitCode> {
         resolved_args.temp_dir.display()
     );
 
-    with_cache(!args.clear, verb, |cache| resolved_args.run(cache, sources))?;
+    resolved_args.run(sources)?;
 
     // Make sure the temporary directory is dropped at the very end.
     std::mem::drop(tmp_dir);
     Ok(ExitCode::SUCCESS)
 }
 
-#[derive(Clone, Copy, Debug, Hash)]
-struct CachePath<P>(P);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Sha256Digest(GenericArray<u8, <Sha256 as OutputSizeUser>::OutputSize>);
 
-impl<P1, P2> PartialEq<CachePath<P1>> for CachePath<P2>
-where
-    P2: PartialEq<P1>,
-{
-    fn eq(&self, other: &CachePath<P1>) -> bool {
-        self.0.eq(&other.0)
+#[derive(Debug)]
+enum Sha256DecodeError {
+    InvalidDigestLength,
+    #[allow(dead_code)]
+    DecodeError(base64::DecodeError),
+}
+
+impl From<base64::DecodeError> for Sha256DecodeError {
+    fn from(error: base64::DecodeError) -> Self {
+        Self::DecodeError(error)
     }
 }
 
-impl<P> Eq for CachePath<P> where P: Eq {}
-
-impl<P: std::fmt::Display> std::fmt::Display for CachePath<P> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl<P: AsRef<Path>> merde::Serialize for CachePath<P> {
-    async fn serialize(
-        &self,
-        serializer: &mut dyn merde::DynSerializer,
-    ) -> Result<(), MerdeError<'static>> {
-        if let Some(str) = self.0.as_ref().to_str() {
-            serializer.write(merde::Event::Str(str.into())).await
-        } else {
-            let start = merde::ArrayStart { size_hint: Some(1) };
-            let encoded = BASE64_STANDARD_NO_PAD.encode(self.0.as_ref().as_os_str().as_bytes());
-            serializer.write(merde::Event::ArrayStart(start)).await?;
-            serializer.write(merde::Event::Str(encoded.into())).await?;
-            serializer.write(merde::Event::ArrayEnd).await
+impl From<base64::DecodeSliceError> for Sha256DecodeError {
+    fn from(error: base64::DecodeSliceError) -> Self {
+        use base64::DecodeSliceError::*;
+        match error {
+            DecodeError(decode_error) => decode_error.into(),
+            OutputSliceTooSmall => Sha256DecodeError::InvalidDigestLength,
         }
     }
 }
 
-impl<'s> merde::Deserialize<'s> for CachePath<Cow<'s, Path>> {
-    async fn deserialize(de: &mut dyn merde::DynDeserializer<'s>) -> Result<Self, MerdeError<'s>> {
-        let ev = de.next().await?;
-        let path = if let merde::Event::ArrayStart(_) = ev {
-            let encoded = de.next().await?.into_str()?;
-            de.next().await?.into_array_end()?;
-            let bytes = BASE64_STANDARD_NO_PAD
-                .decode(encoded.as_bytes())
-                .map_err(|err| MerdeError::StringParsingError {
-                    format: "base64",
-                    source: encoded,
-                    index: 0,
-                    message: err.to_string(),
-                })?;
-            Cow::Owned(PathBuf::from(OsString::from_vec(bytes)))
-        } else {
-            match ev.into_str()? {
-                merde::CowStr::Borrowed(s) => Cow::Borrowed(Path::new(s)),
-                merde::CowStr::Owned(s) => Cow::Owned(PathBuf::from(s.into_string())),
+impl Sha256Digest {
+    /// The buffer size necessary to encode a sha356 digest using base64.
+    const SHA256_ENCODED_SIZE: usize = 44;
+
+    /// The [`base64::Engine`] to use for en- & decoding.
+    const CODING_ENGINE: base64::engine::GeneralPurpose = BASE64_STANDARD_NO_PAD;
+
+    fn with_encoding<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        let mut buf = [0; Self::SHA256_ENCODED_SIZE];
+        let encoded_length = Self::CODING_ENGINE
+            .encode_slice(self.0, &mut buf)
+            .expect("miscalculated buffer size");
+        f(&mut buf[..encoded_length])
+    }
+
+    fn decode(base64_bytes: &[u8]) -> Result<Self, Sha256DecodeError> {
+        let mut sha256_buf = GenericArray::default();
+        let n = Self::CODING_ENGINE.decode_slice(base64_bytes, &mut sha256_buf)?;
+        (n == sha256_buf.len())
+            .then_some(Sha256Digest(sha256_buf))
+            .ok_or(Sha256DecodeError::InvalidDigestLength)
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct SourceHash {
+    digest: Sha256Digest,
+}
+
+#[derive(Debug)]
+enum SourceHashReadError {
+    CantParse,
+    #[allow(dead_code)]
+    IOError(std::io::Error),
+    #[allow(dead_code)]
+    DigestDecodeError(Sha256DecodeError),
+}
+
+impl From<std::io::Error> for SourceHashReadError {
+    fn from(error: std::io::Error) -> Self {
+        Self::IOError(error)
+    }
+}
+
+impl From<Sha256DecodeError> for SourceHashReadError {
+    fn from(error: Sha256DecodeError) -> Self {
+        Self::DigestDecodeError(error)
+    }
+}
+
+impl SourceHash {
+    const PREFIX: &str = "% SOURCE-HASH=";
+    const HASH_LINE_CAP: usize =
+        (Self::PREFIX.len() + Sha256Digest::SHA256_ENCODED_SIZE + 1).next_power_of_two();
+
+    fn new(s: &str) -> Self {
+        SourceHash {
+            digest: Sha256Digest(Sha256::digest(s)),
+        }
+    }
+
+    fn write(&self, writer: impl std::io::Write) -> std::io::Result<()> {
+        self.digest.with_encoding(|ascii_digest| {
+            let mut slices = [
+                IoSlice::new(Self::PREFIX.as_bytes()),
+                IoSlice::new(ascii_digest),
+                IoSlice::new(b"\n\n"),
+            ];
+            write_all_vectored(writer, &mut slices)
+        })
+    }
+
+    fn try_read(mut reader: impl std::io::Read) -> Result<Self, SourceHashReadError> {
+        let mut buffer = [0u8; Self::HASH_LINE_CAP];
+        let mut filled = 0;
+
+        let nl_idx = loop {
+            // Read more data into buffer.
+            //
+            // SAFETY: `filled` is always less than `Self::HASH_LINE_CAP`.
+            let slice_to_fill = unsafe { buffer.get_unchecked_mut(filled..) };
+            let bytes_read = loop {
+                match reader.read(slice_to_fill) {
+                    // Reached EOF before reading the source hash.
+                    Ok(0) => return Err(SourceHashReadError::CantParse),
+                    // Filled the buffer with additional data.
+                    Ok(n) => break n.min(slice_to_fill.len()),
+                    // Repeat if interrupted.
+                    Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                    // Abort on any other I/O errors.
+                    Err(err) => return Err(err.into()),
+                }
+            };
+
+            // Check if the additional data contains the newline byte.
+            //
+            // SAFETY: `bytes_read` is less than or equal to `slice_to_fill.len()`.
+            let additional_bytes = unsafe { slice_to_fill.get_unchecked(..bytes_read) };
+            if let Some(nl_idx) = memchr::memchr(b'\n', additional_bytes) {
+                // Adjust nl_idx with the data already read in previous iterations.
+                break filled + nl_idx;
+            }
+
+            // Otherwise advance `filled` by `bytes_read`. Abort, if the whole buffer was filled
+            // without a newline byte.
+            filled += bytes_read;
+            if filled == buffer.len() {
+                return Err(SourceHashReadError::CantParse);
             }
         };
-        Ok(CachePath(path))
-    }
-}
 
-impl<'s, P: ToOwned + ?Sized> merde::IntoStatic for CachePath<Cow<'s, P>>
-where
-    P::Owned: 'static,
-{
-    type Output = CachePath<P::Owned>;
+        // Extract the first line from `buffer`.
+        //
+        // SAFETY: `nl_idx` is less than `buffer.len().
+        let first_line = unsafe { buffer.get_unchecked(..nl_idx) };
+        // Try to strip the `PREFIX` to get to the actual hash.
+        let encoded_hash = first_line
+            .strip_prefix(Self::PREFIX.as_bytes())
+            .ok_or(SourceHashReadError::CantParse)?;
+        // Trim any ascii-whitespace bytes from the end.
+        let last_hash_byte = encoded_hash
+            .iter()
+            .rposition(|b| !b.is_ascii_whitespace())
+            .ok_or(SourceHashReadError::CantParse)?;
+        // SAFETY: `last_hash_byte` is less than `encoded_hash.len()` because it was returned by
+        // `encoded_hash.iter().rposition()`.
+        let extracted_hash = unsafe { encoded_hash.get_unchecked(..=last_hash_byte) };
 
-    fn into_static(self) -> Self::Output {
-        CachePath(self.0.into_owned())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Sha256Digest(GenericArray<u8, <Sha256 as OutputSizeUser>::OutputSize>);
-
-impl merde::Serialize for Sha256Digest {
-    async fn serialize(
-        &self,
-        serializer: &mut dyn merde::DynSerializer,
-    ) -> Result<(), MerdeError<'static>> {
-        serializer
-            .write(merde::Event::Str(
-                BASE64_STANDARD_NO_PAD.encode(self.0).into(),
-            ))
-            .await
-    }
-}
-
-impl<'s> merde::Deserialize<'s> for Sha256Digest {
-    async fn deserialize(de: &mut dyn merde::DynDeserializer<'s>) -> Result<Self, MerdeError<'s>> {
-        let digest_str = de.next().await?.into_str()?;
-        let mut sha256_buf = GenericArray::default();
-        let err = match BASE64_STANDARD_NO_PAD.decode_slice(digest_str.as_bytes(), &mut sha256_buf)
-        {
-            Ok(n) if n == sha256_buf.len() => return Ok(Sha256Digest(sha256_buf)),
-            Ok(n) => format!(
-                "digest to short: expected {} bytes, got {n}",
-                sha256_buf.len()
-            ),
-            Err(err) => err.to_string(),
-        };
-        Err(MerdeError::StringParsingError {
-            format: "base64/sha356",
-            source: digest_str,
-            index: 0,
-            message: err.to_string(),
+        // We extracted the hash, now try to decode the base64 representation.
+        Ok(SourceHash {
+            digest: Sha256Digest::decode(extracted_hash)?,
         })
     }
 }
 
-struct CacheEntry {
-    digest: Sha256Digest,
-    fully_typechecked: bool,
-}
-
-impl CacheEntry {
-    /// Updates the `CacheEntry` and returns `true` if a recompilation is necessary.
-    fn update(&mut self, digest: Sha256Digest, full_typechecking: bool) -> bool {
-        if self.digest != digest {
-            self.digest = digest;
-            self.fully_typechecked = full_typechecking;
-            true
-        } else if self.fully_typechecked || !full_typechecking {
-            false
-        } else {
-            self.fully_typechecked = full_typechecking;
-            true
-        }
+impl std::fmt::Display for SourceHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        self.digest
+            .with_encoding(|base64_digest| f.write_str(&String::from_utf8_lossy(base64_digest)))
     }
 }
-
-merde::derive! {
-    impl (Serialize, Deserialize) for struct CacheEntry {
-        digest,
-        fully_typechecked
-    }
-}
-
-type Cache<'a> = HashMap<CachePath<Cow<'a, Path>>, CacheEntry>;
 
 struct Agdatex {
     output_dir: PathBuf,
@@ -438,7 +356,8 @@ struct Agdatex {
 #[derive(Default)]
 struct State {
     source_buffer: String,
-    translated_item_paths: Vec<(PathBuf, Sha256Digest)>,
+    /// Paths to translated items that need to be (re)compiled.
+    translated_item_paths: Vec<PathBuf>,
     translator: Translator,
     diagnostics_count: u32,
     cur_assemble_file: Option<File>,
@@ -458,20 +377,20 @@ impl FileAction {
         }
     }
 
-    fn adjust_target_file_name(self, source: Cow<'_, Path>) -> Cow<'_, Path> {
+    fn adjust_target_file_name(self, source: &Path) -> Cow<'_, Path> {
         match self {
-            FileAction::Copy => source,
+            FileAction::Copy => source.into(),
             FileAction::Translate => {
-                Cow::Owned(adjusted_translation_target_file_name(source.into_owned()))
+                let mut p = source.to_owned();
+                p.set_extension(EXT_TRANSLATED);
+                p.into()
             }
         }
     }
 }
 
-fn adjusted_translation_target_file_name(mut path: PathBuf) -> PathBuf {
-    path.set_extension("lagda.tex");
-    path
-}
+const EXT_COMPILED: &str = "tex";
+const EXT_TRANSLATED: &str = "lagda.tex";
 
 #[derive(Debug, Clone, Copy)]
 enum Item<'a> {
@@ -543,9 +462,14 @@ impl Item<'_> {
                     .open_at(parent_fd_source, name);
                 match res {
                     Ok(fd) => Some(fd),
-                    // Have to go this way until ErrorKind::FilesystemLoop is stabilized.
-                    Err(err) if err.raw_os_error() == Some(libc::ELOOP) => None,
-                    Err(err) => return Err(err.into()),
+                    Err(err) => {
+                        // Have to go this way until ErrorKind::FilesystemLoop is stabilized.
+                        if err.raw_os_error().map(Errno::from_raw) == Some(Errno::ELOOP) {
+                            None
+                        } else {
+                            return Err(err.into());
+                        }
+                    }
                 }
             }
         })
@@ -571,9 +495,13 @@ impl Item<'_> {
     }
 
     fn open_translation_target_file(&self, base: impl AsRef<Path>) -> Result<File> {
+        let adjust_ext = |mut p: PathBuf| {
+            p.set_extension(EXT_COMPILED);
+            p
+        };
         Ok(match self {
             Item::UserInput { path } => {
-                let target_path = adjusted_translation_target_file_name(base.as_ref().join(path));
+                let target_path = adjust_ext(base.as_ref().join(path));
                 OpenOptions::new()
                     .write(true)
                     .create(true)
@@ -585,7 +513,7 @@ impl Item<'_> {
                 parent_fd_target,
                 ..
             } => {
-                let target_name = adjusted_translation_target_file_name(name.into());
+                let target_name = adjust_ext(name.into());
                 OpenOptionsAt::default()
                     .write(fs_at::OpenOptionsWriteMode::Write)
                     .create(true)
@@ -595,23 +523,27 @@ impl Item<'_> {
         })
     }
 
-    fn push_path_cap(&self, path_buf: &mut PathBuf, additional_cap: usize) {
-        match self {
-            Item::UserInput { path } => {
-                path_buf.reserve(path.as_os_str().len() + 1 + additional_cap);
-                path_buf.push(path)
-            }
-            Item::ChildItem {
-                name, parent_item, ..
-            } => {
-                parent_item.push_path_cap(path_buf, additional_cap + 1 + name.len());
-                path_buf.push(name);
+    fn push_path(&self, path_buf: &mut PathBuf) {
+        // Traverse the item tree summing the needed additional capacity before pushing each
+        // segment.
+        fn push_with_cap(item: &Item, path_buf: &mut PathBuf, additional_cap: usize) {
+            match item {
+                Item::UserInput { path } => {
+                    let additional_cap = additional_cap + 1 + path.as_os_str().len();
+                    path_buf.reserve(additional_cap);
+                    path_buf.push(path)
+                }
+                Item::ChildItem {
+                    name, parent_item, ..
+                } => {
+                    let additional_cap = additional_cap + 1 + name.len();
+                    push_with_cap(parent_item, path_buf, additional_cap);
+                    path_buf.push(name);
+                }
             }
         }
-    }
 
-    fn push_path(&self, path_buf: &mut PathBuf) {
-        self.push_path_cap(path_buf, 0);
+        push_with_cap(self, path_buf, 0);
     }
 
     fn to_path_buf(self) -> PathBuf {
@@ -622,7 +554,7 @@ impl Item<'_> {
 }
 
 impl Agdatex {
-    fn run(mut self, cache: &mut Cache, sources: Vec<PathBuf>) -> Result<()> {
+    fn run(mut self, sources: Vec<PathBuf>) -> Result<()> {
         // Ensure the output directory exists.
         std::fs::create_dir_all(&self.output_dir)?;
 
@@ -637,25 +569,7 @@ impl Agdatex {
         latex_dir_arg.push(std::path::absolute(&self.output_dir)?);
 
         // Compile all the translated files to LaTeX.
-        for (translated, trans_hash) in self.state.translated_item_paths {
-            let compile = match cache.entry(CachePath(translated.clone().into())) {
-                Entry::Occupied(mut entry) => {
-                    entry.get_mut().update(trans_hash, !self.fast_compile)
-                }
-                Entry::Vacant(entry) => {
-                    entry.insert(CacheEntry {
-                        digest: trans_hash,
-                        fully_typechecked: !self.fast_compile,
-                    });
-                    true
-                }
-            };
-
-            if !compile {
-                verb!(self.verb, "CACHE {}", translated.display());
-                continue;
-            }
-
+        for translated in self.state.translated_item_paths {
             verb!(self.verb, "COMPL {}", translated.display());
             Command::new("agda")
                 .current_dir(&self.temp_dir)
@@ -667,6 +581,51 @@ impl Agdatex {
         }
 
         Ok(())
+    }
+
+    fn read_compiled_source_hash(&self, item: &Item) -> Result<SourceHash, SourceHashReadError> {
+        // Assemble the path where the item will be placed.
+        let mut target_path = self.output_dir.clone();
+        item.push_path(&mut target_path);
+        target_path.with_extension(EXT_COMPILED);
+
+        // Extract the source hash from the previously compiled file.
+        SourceHash::try_read(File::open(target_path)?)
+    }
+
+    fn maybe_push_translated_path(
+        &mut self,
+        item: &Item,
+        source_hash: &SourceHash,
+        translated: PathBuf,
+    ) {
+        match self.read_compiled_source_hash(item) {
+            Ok(compiled_hash) if *source_hash == compiled_hash => {
+                verb!(
+                    self.verb,
+                    "CACHE HIT {} ({source_hash})",
+                    translated.display()
+                );
+                return;
+            }
+            Ok(compiled_hash) => {
+                verb!(
+                    self.verb,
+                    "CACHE MISMATCH {}\n  old: {compiled_hash}\n  new: {source_hash}",
+                    translated.display()
+                );
+            }
+            Err(error) => {
+                verb!(
+                    self.verb,
+                    "CACHE MISMATCH {} ({error:#?})",
+                    translated.display()
+                );
+            }
+        };
+
+        // At this point we are sure to compile this item!
+        self.state.translated_item_paths.push(translated);
     }
 
     fn translate_item(&mut self, item: Item) -> Result<()> {
@@ -740,7 +699,7 @@ impl Agdatex {
         };
 
         let item_path = item.to_path_buf();
-        let item_target_path = action.adjust_target_file_name((&item_path).into());
+        let item_target_path = action.adjust_target_file_name(&item_path);
         let full_target_path = self.temp_dir.join(&item_target_path);
         verb!(
             self.verb,
@@ -759,12 +718,18 @@ impl Agdatex {
 
                 // Open target file.
                 let out_file = item.open_translation_target_file(&self.temp_dir)?;
+                // Write the source hash for future comparison.
+                let source_hash = SourceHash::new(&self.state.source_buffer);
+                source_hash.write(&out_file)?;
 
                 // Translate source.
-                if let Some(translation_hash) = self.translate_src(&item_path, out_file)? {
-                    self.state
-                        .translated_item_paths
-                        .push((item_target_path.into_owned(), translation_hash));
+                //
+                // There is nothing to gain with trying to avoid the `into_owned` call here: at
+                // this point we know that the `Cow` must wrap an allocated value.
+                let item_target_path = item_target_path.into_owned();
+                let should_compile = self.translate_src(item_path, out_file)?;
+                if should_compile {
+                    self.maybe_push_translated_path(&item, &source_hash, item_target_path);
                 }
             }
 
@@ -789,17 +754,27 @@ impl Agdatex {
         Ok(())
     }
 
-    fn translate_src(&mut self, item_path: &Path, out_file: File) -> Result<Option<Sha256Digest>> {
+    /// Translate the current [`source_buffer`][State::source_buffer] and write the Literate Agda
+    /// code to `out_file`.
+    ///
+    /// This function returns `true` if the translation recorded any macros. If no macros were
+    /// encoutered there is no need to compile the file .lagda file to LaTeX.
+    ///
+    /// If there is an open umbrella file ([`State::cur_assemble_file`]) and the translation
+    /// encountered macro definitions this function will add a suitable `\input{..}` line.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if any I/O errors are encoutered while writing to
+    /// `out_file` or when printing diagnostics.
+    fn translate_src(&mut self, item_path: PathBuf, out_file: File) -> Result<bool> {
         let pp_path = LazyCell::new(|| item_path.display().to_string());
         let mut has_macro = false;
-
-        // Prepare the hash collector.
-        let mut output: HashWriter<Sha256, _> = out_file.into();
 
         // Run the translator.
         self.state.translator.run(
             &self.state.source_buffer,
-            &mut output,
+            out_file,
             |diag| {
                 self.state.diagnostics_count += 1;
                 diag.to_report().print(NamedSource {
@@ -817,16 +792,18 @@ impl Agdatex {
         )?;
 
         if has_macro && let Some(ref file) = self.state.cur_assemble_file {
+            let mut tex_path = item_path;
+            tex_path.set_extension(EXT_COMPILED);
             Ltx::new()
                 .command("input")
-                .group(&item_path.as_os_str().to_string_lossy())
+                .group(&tex_path.as_os_str().to_string_lossy())
                 .ln()
                 .ln()
                 .write(file)?;
         }
 
         // The file has to be compiled to LaTeX if it contained any macros.
-        Ok(has_macro.then(|| Sha256Digest(output.finalize().0)))
+        Ok(has_macro)
     }
 }
 
@@ -918,4 +895,27 @@ impl OsStrExt2 for OsStr {
         self.as_encoded_bytes()
             .starts_with(s.as_ref().as_encoded_bytes())
     }
+}
+
+// TODO: use `std::io::Write::write_all_vectored` once stabilised.
+pub fn write_all_vectored(
+    mut writer: impl std::io::Write,
+    mut bufs: &mut [IoSlice<'_>],
+) -> std::io::Result<()> {
+    // The initial `advance_slices` call skips over any empty slices at the start of `bufs`.
+    IoSlice::advance_slices(&mut bufs, 0);
+    while !bufs.is_empty() {
+        match writer.write_vectored(bufs) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
+            }
+            Ok(n) => IoSlice::advance_slices(&mut bufs, n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
