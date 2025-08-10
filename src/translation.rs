@@ -234,12 +234,18 @@ where
             ltx.begin("code", code_arg).ln()
         }
 
-        let code_arg = if hide { "hide" } else { "" };
+        let code_arg = if hide {
+            "hide"
+        } else if macro_mode.inline {
+            "inline"
+        } else {
+            ""
+        };
         match macro_mode.inner_mode {
             Mode::None => {
                 push_code_begin(Ltx::new(), code_arg).write(&mut self.output)?;
             }
-            Mode::Hide | Mode::Macro(_) => {
+            Mode::Hide | Mode::Macro(()) => {
                 push_code_begin(Ltx::new().end("code").pctln(), code_arg)
                     .write(&mut self.output)?;
             }
