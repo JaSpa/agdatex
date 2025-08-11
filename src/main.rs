@@ -16,7 +16,7 @@ use color_eyre::{
 };
 use fs_at::OpenOptions as OpenOptionsAt;
 use ltx_write::Ltx;
-use nix::{NixPath, errno::Errno};
+use nix::errno::Errno;
 use sha2::{
     Digest, Sha256,
     digest::{OutputSizeUser, generic_array::GenericArray},
@@ -553,7 +553,7 @@ impl Item<'_> {
         let source_ext_len = source_path.extension().map(OsStr::len).unwrap_or_default();
 
         let mk_path = |base: &Path, ext: Option<&str>| {
-            let mut cap = base.len() + 1 + source_path.len();
+            let mut cap = base.as_os_str().len() + 1 + source_path.as_os_str().len();
             if let Some(ext) = ext {
                 cap += ext.len().saturating_sub(source_ext_len);
             }
