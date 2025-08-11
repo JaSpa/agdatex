@@ -17,7 +17,7 @@
 \>[0]\<%
 \end{code}
 
-% \STLCSyntax[*]
+% \STLCSyntax
 \NewDocumentCommand\STLCSyntax{s}{%
 \IfBooleanF{#1}{\begin{AgdaMultiCode}}%
 \begin{code}[]%
@@ -52,7 +52,7 @@
 \end{code}%
 \IfBooleanF{#1}{\end{AgdaMultiCode}}}
 
-% \STLCExamples[*]
+% \STLCExamples
 \NewDocumentCommand\STLCExamples{s}{%
 \IfBooleanF{#1}{\begin{AgdaMultiCode}}%
 \begin{code}[]%
@@ -92,14 +92,14 @@
 \AgdaSymbol{=}\<%
 \end{code}
 
-% \STLCEAbs
-\NewDocumentCommand\STLCEAbs{}{%
-\begin{code}[inline]%
+% \STLCEAbs [inline]
+\NewDocumentCommand\STLCEAbs{s}{%
+\begin{code}[\IfBooleanTF{#1}{inline*}{inline}]%
 \>[0][@{}l@{\AgdaIndent{1}}]%
 \>[2]\AgdaOperator{\AgdaInductiveConstructor{λx\AgdaUnderscore{}}}\<%
 \end{code}}
 
-% \STLCHideExample[*]
+% \STLCHideExample
 \NewDocumentCommand\STLCHideExample{s}{%
 \IfBooleanF{#1}{\begin{AgdaMultiCode}}%
 \begin{code}[]%

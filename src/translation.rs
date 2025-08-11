@@ -28,7 +28,7 @@ impl<S> Macro<S> {
     {
         ltx.with_comment(move |l| {
             l.command(self.name.as_ref())
-                .push(if self.inline { "" } else { "[*]" })
+                .push(if self.inline { " [inline]" } else { "" })
         })
     }
 
@@ -237,7 +237,7 @@ where
         let code_arg = if hide {
             "hide"
         } else if macro_mode.inline {
-            "inline"
+            r"\IfBooleanTF{#1}{inline*}{inline}"
         } else {
             ""
         };
@@ -347,14 +347,14 @@ where
         };
         (self.macro_fn)(macro_)?;
 
-        // Non-inline macros come in a starred and unstarred form. Inline macros do not take any
-        // arguments.
-        let macro_spec = if macro_mode.inline { "" } else { "s" };
+        /*
+         * \NewDocumentCommand\NAME{s}{
+         */
         let ltx = macro_
             .to_ltx_comment()
             .command("NewDocumentCommand")
             .command(&name)
-            .group(macro_spec)
+            .group("s")
             .push(Group::TEX.open)
             .pctln();
 
