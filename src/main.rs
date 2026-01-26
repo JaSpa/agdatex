@@ -50,8 +50,12 @@ macro_rules! verb {
 
 #[derive(Debug, Parser)]
 struct Args {
-    /// Output directory for Agda's LaTeX backend; forwarded as `--latex-dir`.
-    #[arg(short, long = "outputdir", default_value = "latex")]
+    /// The directory in which OUTPUT_DIR is placed.
+    #[arg(short, long = "base", default_value = ".")]
+    base_dir: PathBuf,
+
+    /// Output directory inside BASE_DIR for Agda's LaTeX backend; forwarded as `--latex-dir`.
+    #[arg(short, long = "output", default_value = "latex")]
     output_dir: PathBuf,
 
     /// Temporary directory to copy the project root to. [default: fresh system-dependent
@@ -149,11 +153,13 @@ fn main() -> Result<ExitCode> {
     verb!(verb, "Canonicalized sources: {sources:#?}");
 
     let mut tmp_dir: Option<TempDir> = None;
+    let output_dir = args.base_dir.join(&args.output_dir);
     let resolved_args = Agdatex {
         verb,
         fast_compile: args.fast,
         ignore_cache: args.clear,
-        output_dir: args.output_dir,
+        output_dir,
+        latex_dir: args.output_dir,
         trans_dir: if let Some(tmp) = args.temp_dir {
             tmp
         } else {
@@ -347,6 +353,8 @@ impl std::fmt::Display for SourceHash {
 }
 
 struct Agdatex {
+    /// Directory prefixed to generated `\input{..}` macros.
+    latex_dir: PathBuf,
     output_dir: PathBuf,
     trans_dir: PathBuf,
     verb: VerbOutput,
@@ -860,7 +868,12 @@ impl Agdatex {
         )?;
 
         if has_macro && let Some(ref file) = self.state.cur_assemble_file {
-            let input_path = item_paths.source_path.with_extension("");
+            let mut input_path = if self.latex_dir.as_os_str().is_empty() {
+                item_paths.source_path.clone()
+            } else {
+                self.latex_dir.join(&item_paths.source_path)
+            };
+            input_path.set_extension("");
             let input_path_str = input_path.as_os_str().to_string_lossy();
             Ltx::new()
                 .command("input")
