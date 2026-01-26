@@ -401,7 +401,7 @@ enum Item<'a> {
     },
 }
 
-impl Item<'_> {
+impl<'a> Item<'a> {
     fn file_name(&self) -> Option<&OsStr> {
         match self {
             Item::UserInput { path } => path.file_name(),
@@ -436,7 +436,7 @@ impl Item<'_> {
             && let Item::UserInput { path } = self
         {
             Err(eyre!(
-                "I don't know what to do with input file `{}'",
+                "I don't know what to do with input file {:?}",
                 path.display()
             ))
         } else {
@@ -446,7 +446,9 @@ impl Item<'_> {
 
     fn open_source(&self) -> Result<Option<File>> {
         Ok(match self {
-            Item::UserInput { path } => Some(File::open(path)?),
+            Item::UserInput { path } => Some(File::open(path).wrap_err_with(|| {
+                format!("failed to open source for item at {:?}", path.display())
+            })?),
             Item::ChildItem {
                 parent_fd_source,
                 name,
@@ -463,7 +465,10 @@ impl Item<'_> {
                         if err.raw_os_error().map(Errno::from_raw) == Some(Errno::ELOOP) {
                             None
                         } else {
-                            return Err(err.into());
+                            return Err(color_eyre::Report::from(err).wrap_err(format!(
+                                "failed to open source for item named {name:?} at path {:?}",
+                                self.as_full_path().display()
+                            )));
                         }
                     }
                 }
@@ -477,8 +482,19 @@ impl Item<'_> {
                 // There is no truly race-free way to create the directory and open it. Don't go
                 // overboard here.
                 let target_path = base.as_ref().join(path);
-                std::fs::create_dir_all(&target_path)?;
-                File::open(target_path)?
+                std::fs::create_dir_all(&target_path).wrap_err_with(|| {
+                    format!(
+                        "failed to create translation target directory {:?} for item at {:?}",
+                        target_path.display(),
+                        path.display(),
+                    )
+                })?;
+                File::open(&target_path).wrap_err_with(|| {
+                    format!(
+                        "fatal: cannot open just created directory {:?}",
+                        target_path.display(),
+                    )
+                })?
             }
             Item::ChildItem {
                 name,
@@ -497,12 +513,22 @@ impl Item<'_> {
         };
         Ok(match self {
             Item::UserInput { path } => {
-                let target_path = adjust_ext(base.as_ref().join(path));
+                let base = base.as_ref();
+                let target_path = adjust_ext(base.join(path));
+                eprintln!("base = {:?}", base.display());
+                Command::new("/bin/ls").arg("-l").arg(base).expect_run()?;
                 OpenOptions::new()
                     .write(true)
                     .create(true)
                     .truncate(true)
-                    .open(target_path)?
+                    .open(&target_path)
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to open translation target at {:?} for item at {:?}",
+                            target_path.display(),
+                            path.display()
+                        )
+                    })?
             }
             Item::ChildItem {
                 name,
@@ -514,7 +540,13 @@ impl Item<'_> {
                     .write(fs_at::OpenOptionsWriteMode::Write)
                     .create(true)
                     .truncate(true)
-                    .open_at(parent_fd_target, target_name)?
+                    .open_at(parent_fd_target, &target_name).wrap_err_with(|| {
+                        format!(
+                            "failed to open translation target at {:?} (relative to parent target) for item at {:?}",
+                            target_name.display(),
+                            self.as_full_path().display()
+                        )
+                    })?
             }
         })
     }
@@ -546,6 +578,14 @@ impl Item<'_> {
         let mut buf = PathBuf::new();
         self.push_path(&mut buf);
         buf
+    }
+
+    fn as_full_path(self) -> Cow<'a, Path> {
+        if let Item::UserInput { path } = self {
+            Cow::Borrowed(path)
+        } else {
+            self.to_path_buf().into()
+        }
     }
 
     fn assemble_item_paths(&self, action: FileAction, trans_base: impl AsRef<Path>) -> ItemPaths {
@@ -646,23 +686,31 @@ impl Agdatex {
     }
 
     fn translate_item(&mut self, item: Item) -> Result<()> {
-        let Some(fd_item) = item.open_source()? else {
-            return Ok(());
+        let mut go = || -> Result<()> {
+            let Some(fd_item) = item.open_source()? else {
+                return Ok(());
+            };
+
+            if fd_item.metadata()?.file_type().is_dir() {
+                self.translate_dir(item, fd_item)?;
+            } else {
+                self.translate_file(item, fd_item)?;
+            }
+            Ok(())
         };
 
-        if fd_item.metadata()?.file_type().is_dir() {
-            self.translate_dir(item, fd_item)?;
-        } else {
-            self.translate_file(item, fd_item)?;
-        }
-
-        Ok(())
+        go().wrap_err_with(|| {
+            format!(
+                "failed to translate item at path {:?}",
+                item.as_full_path().display()
+            )
+        })
     }
 
     fn translate_dir(&mut self, parent_item: Item, fd: File) -> Result<()> {
         let mut item_path_display = String::new();
         self.verb.if_enabled(|| {
-            item_path_display = parent_item.to_path_buf().display().to_string();
+            item_path_display = parent_item.as_full_path().display().to_string();
         });
         verb!(self.verb, "ENTER {item_path_display}");
 
@@ -680,7 +728,10 @@ impl Agdatex {
                     .write(true)
                     .create(true)
                     .truncate(true)
-                    .open(path)?,
+                    .open(&path)
+                    .wrap_err_with(|| {
+                        format!("failed to open output main file at {:?}", path.display())
+                    })?,
             );
         }
 
@@ -711,7 +762,7 @@ impl Agdatex {
     fn translate_file(&mut self, item: Item, mut file: File) -> Result<()> {
         // Determine what to do with this file based on the extension.
         let Some(action) = item.file_action()? else {
-            verb!(self.verb, "SKIP {}", item.to_path_buf().display());
+            verb!(self.verb, "SKIP {}", item.as_full_path().display());
             return Ok(());
         };
 
@@ -729,7 +780,13 @@ impl Agdatex {
             FileAction::Translate => {
                 // Read in source.
                 self.state.source_buffer.clear();
-                file.read_to_string(&mut self.state.source_buffer)?;
+                file.read_to_string(&mut self.state.source_buffer)
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to read source of item at path {:?}",
+                            item.as_full_path().display()
+                        )
+                    })?;
 
                 // Open target file.
                 let out_file = item.open_translation_target_file(&self.trans_dir)?;
