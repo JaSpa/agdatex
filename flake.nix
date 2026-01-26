@@ -26,8 +26,9 @@
         rust = pkgs.callPackage naersk { };
       in
       {
-        packages = {
-          default = rust.buildPackage { src = lib.cleanSource ./.; };
+        packages = rec {
+          default = agdatex;
+          agdatex = rust.buildPackage { src = lib.cleanSource ./.; };
         };
       }
     );
