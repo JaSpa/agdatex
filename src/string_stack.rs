@@ -49,18 +49,18 @@ impl StringStack {
             .map(|&len| unsafe { self.data.get_unchecked_mut(len..) })
     }
 
-    pub fn try_pop(&mut self) -> Option<PoppedStr> {
+    pub fn try_pop(&mut self) -> Option<PoppedStr<'_>> {
         self.lens.pop().map(|len| PoppedStr {
             stack: self,
             pop_len: len,
         })
     }
 
-    pub fn pop(&mut self) -> PoppedStr {
+    pub fn pop(&mut self) -> PoppedStr<'_> {
         self.try_pop().expect("StringStack not empty")
     }
 
-    pub fn iter(&self) -> Iter {
+    pub fn iter(&self) -> Iter<'_> {
         Iter {
             data: &self.data,
             lens: self.lens.iter(),
