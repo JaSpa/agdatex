@@ -19,7 +19,7 @@ use ltx_write::Ltx;
 use nix::errno::Errno;
 use sha2::{
     Digest, Sha256,
-    digest::{OutputSizeUser, generic_array::GenericArray},
+    digest::{OutputSizeUser, array::Array},
 };
 use tempdir::TempDir;
 use translation::Translator;
@@ -185,7 +185,7 @@ fn main() -> Result<ExitCode> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Sha256Digest(GenericArray<u8, <Sha256 as OutputSizeUser>::OutputSize>);
+struct Sha256Digest(Array<u8, <Sha256 as OutputSizeUser>::OutputSize>);
 
 #[derive(Debug)]
 enum Sha256DecodeError {
@@ -226,7 +226,7 @@ impl Sha256Digest {
     }
 
     fn decode(base64_bytes: &[u8]) -> Result<Self, Sha256DecodeError> {
-        let mut sha256_buf = GenericArray::default();
+        let mut sha256_buf = Array::default();
         let n = Self::CODING_ENGINE.decode_slice(base64_bytes, &mut sha256_buf)?;
         (n == sha256_buf.len())
             .then_some(Sha256Digest(sha256_buf))

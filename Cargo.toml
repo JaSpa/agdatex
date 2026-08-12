@@ -4,12 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ariadne = "0.5.1"
-base64 = "0.22.1"
+ariadne = "0.6.0"
+base64 = "0.23.1"
 clap = { version = "4.5.40", features = ["derive", "cargo"] }
 color-eyre = { version = "0.6.5", default-features = false }
 fs_at = "0.2.1"
 memchr = "2.7.5"
-nix = "0.30.1"
-sha2 = "0.10.9"
+nix = "0.31.3"
+sha2 = "0.11.0"
 tempdir = "0.3.7"
