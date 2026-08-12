@@ -50,6 +50,17 @@ impl<S: AsRef<str>> std::fmt::Display for Macro<S> {
     }
 }
 
+impl<S1, S2> PartialEq<Macro<S2>> for Macro<S1>
+where
+    S1: PartialEq<S2>,
+{
+    fn eq(&self, other: &Macro<S2>) -> bool {
+        self.line == other.line && self.inline == other.inline && self.name == other.name
+    }
+}
+
+impl<S> Eq for Macro<S> where S: Eq {}
+
 #[derive(Default)]
 pub struct Translator {
     namespaces: StringStack,
@@ -237,9 +248,9 @@ where
         let code_arg = if hide {
             "hide"
         } else if macro_mode.inline {
-            r"\IfBooleanTF{#1}{inline*}{inline}"
+            r"\IfBooleanTF{#1}{inline*}{inline},#2"
         } else {
-            ""
+            "#2"
         };
         match macro_mode.inner_mode {
             Mode::None => {
@@ -348,13 +359,13 @@ where
         (self.macro_fn)(macro_)?;
 
         /*
-         * \NewDocumentCommand\NAME{s}{
+         * \NewDocumentCommand\NAME{sO{}}{
          */
         let ltx = macro_
             .to_ltx_comment()
             .command("NewDocumentCommand")
             .command(&name)
-            .group("s")
+            .group("sO{}")
             .push(Group::TEX.open)
             .pctln();
 
@@ -505,7 +516,7 @@ where
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Diagnostic {
     OpenMacro {
         cur_start_span: Span,
@@ -801,5 +812,146 @@ impl<'a> Command<'a> {
             trailing_chars,
             invalid_inline_annot,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    type BoxDiagFn<'a> = Box<dyn FnMut(Diagnostic) -> io::Result<()> + 'a>;
+    type BoxMacroFn<'a> = Box<dyn for<'s> FnMut(Macro<&'s str>) -> io::Result<()> + 'a>;
+
+    #[derive(Default)]
+    struct TranslationContext {
+        output: Vec<u8>,
+        namespaces: StringStack,
+        hide_stack: HideStack,
+        diagnostics: Vec<Diagnostic>,
+        macros: Vec<Macro<String>>,
+    }
+
+    impl TranslationContext {
+        fn translation(&mut self) -> Translation<'_, BoxDiagFn<'_>, BoxMacroFn<'_>> {
+            Translation::new(
+                &mut self.output,
+                Box::new(|d| {
+                    self.diagnostics.push(d);
+                    Ok(())
+                }),
+                Box::new(|m| {
+                    self.macros.push(m.to_owned());
+                    Ok(())
+                }),
+                &mut self.namespaces,
+                &mut self.hide_stack,
+            )
+        }
+
+        fn assert_output(&self, lines: &[&str]) {
+            let actual = str::from_utf8(&self.output).expect("non UTF-8 output");
+            let expected = lines.join("\n");
+            assert_eq!(actual, expected);
+        }
+
+        fn assert_diagnostics(&self, diagnostics: &[Diagnostic]) {
+            assert_eq!(self.diagnostics, diagnostics);
+        }
+
+        fn assert_macros(&self, macros: &[Macro<&str>]) {
+            assert_eq!(self.macros, macros);
+        }
+    }
+
+    #[test]
+    fn inline_macro() {
+        let mut tcx = TranslationContext::default();
+        let mut t = tcx.translation();
+
+        t.add_command(
+            Command::MacroStart {
+                name: SpanStr::new("MyMacro"),
+                auto_close: false,
+                inline: true,
+                span: Span::default(),
+            },
+            0,
+        )
+        .expect("add_command failed");
+
+        t.add_verbatim("Hello!", Span::default(), true)
+            .expect("add_verbatim failed");
+
+        t.add_command(Command::MacroEnd(Span::default()), 0)
+            .expect("add_command failed");
+
+        drop(t);
+
+        tcx.assert_diagnostics(&[]);
+
+        tcx.assert_macros(&[Macro {
+            name: "MyMacro",
+            line: 0,
+            inline: true,
+        }]);
+
+        tcx.assert_output(&[
+            r"% \MyMacro [inline]",
+            r"\NewDocumentCommand\MyMacro{sO{}}{%",
+            r"\begin{code}[\IfBooleanTF{#1}{inline*}{inline},#2]",
+            r"Hello!",
+            r"\end{code}}",
+            r"",
+            r"",
+        ]);
+    }
+
+    #[test]
+    fn ordinary_macro() {
+        let mut tcx = TranslationContext::default();
+        let mut t = tcx.translation();
+
+        t.add_command(
+            Command::MacroStart {
+                name: SpanStr::new("MyMacro"),
+                auto_close: false,
+                inline: false,
+                span: Span::default(),
+            },
+            0,
+        )
+        .expect("add_command failed");
+
+        t.add_verbatim("Hello!", Span::default(), true)
+            .expect("add_verbatim failed");
+
+        t.add_command(Command::MacroEnd(Span::default()), 0)
+            .expect("add_command failed");
+
+        drop(t);
+
+        tcx.assert_diagnostics(&[]);
+
+        tcx.assert_macros(&[Macro {
+            name: "MyMacro",
+            line: 0,
+            inline: false,
+        }]);
+
+        tcx.assert_output(&[
+            r"% \MyMacro",
+            r"\NewDocumentCommand\MyMacro{sO{}}{%",
+            r"\IfBooleanF{#1}{\begin{AgdaMultiCode}}%",
+            r"\begin{code}[#2]",
+            r"Hello!",
+            r"\end{code}%",
+            r"\IfBooleanF{#1}{\end{AgdaMultiCode}}}",
+            r"",
+            r"",
+        ]);
     }
 }

@@ -13,3 +13,6 @@ memchr = "2.7.5"
 nix = "0.31.3"
 sha2 = "0.11.0"
 tempdir = "0.3.7"
+
+[dev-dependencies]
+pretty_assertions = "1.4.1"

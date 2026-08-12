@@ -214,8 +214,9 @@ impl std::fmt::Debug for PoppedStr<'_> {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     const S1: &str = "hi";
     const S2: &str = "there";
@@ -277,6 +278,10 @@ mod test {
         let mut sink_fwd = Vec::new();
         let mut sink_bwd = Vec::new();
 
+        #[expect(
+            clippy::while_let_loop,
+            reason = "preserve the symmetry between the two let guards"
+        )]
         loop {
             let Some(fwd) = iter.next() else {
                 break;
@@ -301,6 +306,10 @@ mod test {
         let mut sink_fwd = Vec::new();
         let mut sink_bwd = Vec::new();
 
+        #[expect(
+            clippy::while_let_loop,
+            reason = "preserve the symmetry between the two let guards"
+        )]
         loop {
             let Some(bwd) = iter.next_back() else {
                 break;
