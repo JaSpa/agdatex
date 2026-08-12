@@ -24,12 +24,25 @@
         inherit (pkgs) lib;
 
         rust = pkgs.callPackage naersk { };
+
+        buildAgdatex =
+          args:
+          rust.buildPackage (
+            {
+              src = lib.cleanSource ./.;
+            }
+            // args
+          );
       in
       {
+        formatter = pkgs.nixfmt;
+
         packages = rec {
           default = agdatex;
-          agdatex = rust.buildPackage { src = lib.cleanSource ./.; };
+          agdatex = buildAgdatex { };
         };
+
+        checks.tests = buildAgdatex { mode = "test"; };
       }
     );
 }
